@@ -1,8 +1,11 @@
 #include "ctranslate2/models/whisper.h"
 
 #include <algorithm>
+#include <chrono>
 
+#include "ctranslate2/continuous_decoding.h"
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/sampling.h"
 
 #include "dispatch.h"
 #include "dtw.h"
@@ -725,6 +728,291 @@ namespace ctranslate2 {
                                median_filter_width);
         },
         batch_size);
+    }
+
+
+    // --- WhisperContinuousBatcher implementation ---
+
+    WhisperContinuousBatcher::WhisperContinuousBatcher(
+        const std::string& model_path,
+        size_t max_slots,
+        const WhisperOptions& default_options,
+        Device device,
+        int device_index,
+        ComputeType compute_type)
+      : _max_slots(max_slots)
+      , _options(default_options)
+    {
+      auto model = Model::load(model_path, device, device_index, compute_type);
+      _model = std::dynamic_pointer_cast<const WhisperModel>(model);
+      if (!_model)
+        throw std::invalid_argument("The model at " + model_path + " is not a Whisper model");
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      _encoder = std::make_unique<layers::WhisperEncoder>(*_model, "encoder");
+      _decoder = std::make_unique<layers::WhisperDecoder>(*_model, "decoder");
+
+      const auto& vocabulary = _model->get_vocabulary();
+      _sot_id = vocabulary.bos_id();
+      _eot_id = vocabulary.eos_id();
+      _no_timestamps_id = vocabulary.to_id("<|notimestamps|>");
+      _no_speech_id = vocabulary.to_id("<|nospeech|>");
+      if (_no_speech_id == vocabulary.unk_id())
+        _no_speech_id = vocabulary.to_id("<|nocaptions|>");
+
+      _replica = std::make_unique<WhisperReplica>(_model);
+    }
+
+    WhisperContinuousBatcher::~WhisperContinuousBatcher() {
+      stop();
+    }
+
+    size_t WhisperContinuousBatcher::submit(StorageView features,
+                                            std::vector<size_t> prompt) {
+      const size_t id = _next_id.fetch_add(1);
+      {
+        std::lock_guard<std::mutex> lock(_queue_mutex);
+        _queue.push(Request{id, std::move(features), std::move(prompt)});
+      }
+      _queue_cv.notify_one();
+      return id;
+    }
+
+    WhisperGenerationResult WhisperContinuousBatcher::get_result(size_t request_id) {
+      std::unique_lock<std::mutex> lock(_results_mutex);
+      _results_cv.wait(lock, [&] {
+        return _results.count(request_id) > 0;
+      });
+      WhisperGenerationResult result = std::move(_results[request_id]);
+      _results.erase(request_id);
+      return result;
+    }
+
+    bool WhisperContinuousBatcher::is_ready(size_t request_id) const {
+      std::lock_guard<std::mutex> lock(_results_mutex);
+      return _results.count(request_id) > 0;
+    }
+
+    void WhisperContinuousBatcher::start() {
+      if (_running.exchange(true))
+        return;  // Already running.
+      _worker = std::thread(&WhisperContinuousBatcher::worker_loop, this);
+    }
+
+    void WhisperContinuousBatcher::stop() {
+      if (!_running.exchange(false))
+        return;  // Not running.
+      _queue_cv.notify_all();
+      if (_worker.joinable())
+        _worker.join();
+    }
+
+    StorageView WhisperContinuousBatcher::encode(StorageView features, bool to_cpu) {
+      std::lock_guard<std::mutex> lock(_replica_mutex);
+      return _replica->encode(std::move(features), to_cpu);
+    }
+
+    std::vector<std::vector<std::pair<std::string, float>>>
+    WhisperContinuousBatcher::detect_language(StorageView features) {
+      std::lock_guard<std::mutex> lock(_replica_mutex);
+      return _replica->detect_language(std::move(features));
+    }
+
+    std::vector<WhisperAlignmentResult>
+    WhisperContinuousBatcher::align(StorageView features,
+                                    const std::vector<size_t>& start_sequence,
+                                    const std::vector<std::vector<size_t>>& text_tokens,
+                                    std::vector<size_t> num_frames,
+                                    dim_t median_filter_width) {
+      std::lock_guard<std::mutex> lock(_replica_mutex);
+      return _replica->align(std::move(features),
+                             start_sequence,
+                             text_tokens,
+                             std::move(num_frames),
+                             median_filter_width);
+    }
+
+    bool WhisperContinuousBatcher::is_multilingual() const {
+      return _replica->is_multilingual();
+    }
+
+    void WhisperContinuousBatcher::worker_loop() {
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      // Set up sampler based on options.
+      std::unique_ptr<Sampler> sampler;
+      if (_options.sampling_topk != 1)
+        sampler = std::make_unique<RandomSampler>(
+          _options.sampling_topk, 1.0f, _options.sampling_temperature);
+      else
+        sampler = std::make_unique<BestSampler>();
+
+      // Slot initializer: encode features and run forward_prompt.
+      auto slot_init = [this](layers::Decoder& decoder,
+                              layers::DecoderState& state,
+                              const ContinuousRequest& request) {
+        const Device device = _model->device();
+        const DataType dtype = _encoder->output_type();
+
+        // Encode features if not already encoded.
+        StorageView& memory = state["memory"];
+        memory.move_to(device, dtype);
+        if (!_encoder->is_encoded(memory)) {
+          StorageView encoded(dtype, device);
+          (*_encoder)(memory, encoded);
+          state["memory"] = std::move(encoded);
+        }
+
+        // Prevent forward_prompt from erasing "memory" (standard decode erases it
+        // at step 0 when _retain_memory is absent).  The continuous batching
+        // decoder needs memory to remain in the state so cross-attention layers
+        // can safely dereference the pointer even though cached projections are
+        // already filled.
+        state["_retain_memory"] = StorageView();
+
+        // Run forward_prompt with prompt tokens.
+        if (!request.prompt_tokens.empty()) {
+          StorageView input_ids = layers::make_sequence_inputs(
+            {request.prompt_tokens}, device);
+          _decoder->forward_prompt(input_ids, state);
+        }
+
+        // Remove the marker — the continuous decode loop re-sets it each step.
+        state.erase("_retain_memory");
+      };
+
+      const auto& vocabulary = _model->get_vocabulary();
+
+      // Build Whisper-specific logits processors for continuous batching.
+      std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors;
+
+      // Suppress tokens (user-specified + model defaults).
+      {
+        std::vector<size_t> suppress_ids;
+        for (const auto& id : _options.suppress_tokens) {
+          if (id >= 0)
+            suppress_ids.push_back(id);
+          else if (id == -1) {
+            for (const auto& default_id : _model->config["suppress_ids"])
+              suppress_ids.push_back(default_id);
+          }
+        }
+        if (!suppress_ids.empty())
+          logits_processors.push_back(
+            std::make_shared<ContinuousSuppressTokens>(std::move(suppress_ids)));
+      }
+
+      // Suppress blank at generation step 0.
+      if (_options.suppress_blank) {
+        std::vector<size_t> blank_ids;
+        for (const auto& id : _model->config["suppress_ids_begin"])
+          blank_ids.push_back(id);
+        if (!blank_ids.empty())
+          logits_processors.push_back(
+            std::make_shared<ContinuousSuppressBlank>(std::move(blank_ids)));
+      }
+
+      // Timestamp rules (applied per-slot only when use_timestamps is true).
+      {
+        const size_t timestamp_begin_id = _no_timestamps_id + 1;
+        const size_t timestamp_end_id = vocabulary.size() - 1;
+        const size_t max_initial_timestamp_id =
+          timestamp_begin_id + _options.max_initial_timestamp_index;
+        logits_processors.push_back(
+          std::make_shared<ContinuousTimestampRules>(
+            _eot_id, _no_timestamps_id,
+            timestamp_begin_id, timestamp_end_id,
+            max_initial_timestamp_id));
+      }
+
+      ContinuousDecodingEngine engine(
+        *_decoder,
+        _max_slots,
+        _options.beam_size,
+        _options.length_penalty,
+        _options.patience,
+        _options.num_hypotheses,
+        {_eot_id},
+        _options.max_length,
+        *sampler,
+        std::move(slot_init),
+        std::move(logits_processors));
+
+      // Helper: convert internal Request to ContinuousRequest.
+      auto convert_request = [this](Request& req) -> ContinuousRequest {
+        const size_t pl = get_prompt_length(req.prompt, _sot_id, _no_timestamps_id);
+
+        ContinuousRequest cr;
+        cr.id = req.id;
+        cr.encoder_output = std::move(req.features);
+
+        // Detect whether timestamps are active (no_timestamps token NOT in prompt).
+        cr.use_timestamps = std::find(req.prompt.begin(), req.prompt.end(),
+                                      _no_timestamps_id) == req.prompt.end();
+
+        if (pl <= 1) {
+          cr.start_tokens = std::move(req.prompt);
+        } else {
+          cr.prompt_tokens.assign(req.prompt.begin(),
+                                  req.prompt.begin() + pl - 1);
+          cr.start_tokens.assign(req.prompt.begin() + pl - 1,
+                                 req.prompt.end());
+        }
+        return cr;
+      };
+
+      // QueueProvider: allows the engine to pull new requests mid-decode.
+      QueueProvider queue_provider = [this, &convert_request]()
+          -> std::optional<ContinuousRequest> {
+        std::lock_guard<std::mutex> lock(_queue_mutex);
+        if (_queue.empty())
+          return std::nullopt;
+        Request req = std::move(_queue.front());
+        _queue.pop();
+        return convert_request(req);
+      };
+
+      while (_running) {
+        // Wait for work.
+        std::queue<ContinuousRequest> local_queue;
+        {
+          std::unique_lock<std::mutex> lock(_queue_mutex);
+          _queue_cv.wait(lock, [&] { return !_running || !_queue.empty(); });
+          if (!_running && _queue.empty())
+            break;
+
+          // Brief batching window: wait up to 50ms to collect more requests
+          // so that requests submitted in quick succession land in the same batch.
+          if (_queue.size() < _max_slots) {
+            _queue_cv.wait_for(lock, std::chrono::milliseconds(50),
+              [&] { return !_running || _queue.size() >= _max_slots; });
+          }
+
+          // Drain the shared queue into ContinuousRequests.
+          while (!_queue.empty()) {
+            Request req = std::move(_queue.front());
+            _queue.pop();
+            local_queue.push(convert_request(req));
+          }
+        }
+
+        // Process the batch (no queue_provider — mid-decode slot filling is disabled).
+        auto results = engine.process(local_queue, nullptr);
+
+        // Convert and store results.
+        {
+          std::lock_guard<std::mutex> lock(_results_mutex);
+          for (auto& cr : results) {
+            WhisperGenerationResult wr;
+            wr.sequences = vocabulary.to_tokens(cr.result.hypotheses);
+            wr.sequences_ids = std::move(cr.result.hypotheses);
+            wr.scores = std::move(cr.result.scores);
+            _results[cr.request_id] = std::move(wr);
+          }
+        }
+        _results_cv.notify_all();
+      }
     }
 
 

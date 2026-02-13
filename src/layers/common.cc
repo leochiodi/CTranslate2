@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "ctranslate2/ops/activation.h"
+#include "ctranslate2/ops/ops.h"
 #include "cpu/backend.h"
 #include "dispatch.h"
 
@@ -176,6 +177,58 @@ namespace ctranslate2 {
     void PositionEncoder::operator()(const StorageView& input, StorageView& output, dim_t index) {
       output = input;
       operator()(output, index);
+    }
+
+    void PositionEncoder::operator()(StorageView& input, const StorageView& offsets) {
+      const dim_t batch_size = input.dim(0);
+      const dim_t time = input.dim(1);
+      const dim_t depth = input.dim(-1);
+
+      // Read offsets on CPU to build gather indices and find max position.
+      StorageView offsets_cpu(DataType::INT32);
+      if (offsets.device() != Device::CPU)
+        offsets_cpu.copy_from(offsets.to(Device::CPU));
+      else
+        offsets_cpu.shallow_copy(const_cast<StorageView&>(offsets));
+
+      dim_t max_offset = 0;
+      for (dim_t i = 0; i < batch_size; ++i)
+        max_offset = std::max(max_offset, dim_t(offsets_cpu.at<int32_t>(i)));
+
+      const dim_t max_time = max_offset + time;
+      const StorageView& encodings = get_position_encoding(max_time);
+      const dim_t num_encodings = encodings.dim(0);
+
+      if (max_time > num_encodings)
+        throw std::runtime_error("No position encodings are defined for positions >= "
+                                 + std::to_string(num_encodings)
+                                 + ", but got position "
+                                 + std::to_string(max_time - 1));
+      if (depth != encodings.dim(1))
+        throw std::invalid_argument("Shape mismatch: position encodings have depth "
+                                    + std::to_string(encodings.dim(1))
+                                    + ", but the input has depth "
+                                    + std::to_string(depth));
+
+      // Build gather indices on CPU: [batch_size * time]
+      // indices[b * time + t] = offsets[b] + t
+      StorageView indices({batch_size * time}, DataType::INT32);
+      for (dim_t b = 0; b < batch_size; ++b) {
+        const int32_t off = offsets_cpu.at<int32_t>(b);
+        for (dim_t t = 0; t < time; ++t)
+          indices.at<int32_t>(b * time + t) = off + t;
+      }
+
+      if (input.device() != Device::CPU)
+        indices = indices.to(input.device());
+
+      // Gather position encoding rows: [batch_size * time, depth]
+      StorageView pos_enc(input.dtype(), input.device());
+      ops::Gather(0)(encodings, indices, pos_enc);
+      pos_enc.reshape({batch_size, time, depth});
+
+      // Add per-element position encodings to input.
+      ops::Add()(input, pos_enc, input);
     }
 
 

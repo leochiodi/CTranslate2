@@ -586,6 +586,15 @@ namespace ctranslate2 {
       return decode(ids, nullptr, step, state, logits, attention);
     }
 
+    void TransformerDecoder::operator()(const StorageView& step_offsets,
+                                        const StorageView& ids,
+                                        DecoderState& state,
+                                        StorageView* logits,
+                                        StorageView* attention) {
+      return decode(ids, nullptr, step_offsets, state, logits, attention,
+                    /*return_logits=*/true, /*retain_memory=*/true);
+    }
+
     void TransformerDecoder::operator()(const StorageView& ids,
                                         const StorageView& lengths,
                                         DecoderState& state,
@@ -792,7 +801,7 @@ namespace ctranslate2 {
         layer_in = std::move(*layer_in_chunk);
       }
 
-      if (step == 0) {
+      if (step == 0 && state.count("_retain_memory") == 0) {
         // The memory is no longer needed as its projections were cached in the first step.
         state.erase("memory");
       }
@@ -809,6 +818,230 @@ namespace ctranslate2 {
           for (const auto& heads : alignment_heads)
             alignment_heads_ptr.emplace_back(&heads);
 
+          ops::Concat(1)(alignment_heads_ptr, *attention);
+          if (!is_sequence)
+            attention->squeeze(2);
+        }
+      }
+
+      if (outputs) {
+        if (_output_norm)
+          (*_output_norm)(layer_in, layer_in);
+        if (_project_out) {
+          (*_project_out)(layer_in, layer_out);
+          layer_in = std::move(layer_out);
+        }
+
+        if (_outputs_scale)
+          ops::Mul()(layer_in, *_outputs_scale, layer_in);
+
+        if (return_logits)
+          _proj(layer_in, *outputs);
+        else
+          *outputs = std::move(layer_in);
+
+        if (!is_sequence)
+          outputs->squeeze(1);
+        else if (input_padder)
+          input_padder->add_padding(*outputs);
+      }
+    }
+
+    void TransformerDecoder::decode(const StorageView& ids,
+                                    const StorageView* lengths,
+                                    const StorageView& step_offsets,
+                                    DecoderState& state,
+                                    StorageView* outputs,
+                                    StorageView* attention,
+                                    bool return_logits,
+                                    bool retain_memory) {
+      PROFILE("TransformerDecoder_continuous");
+      const DataType dtype = output_type();
+      const Device device = ids.device();
+      const bool is_sequence = ids.rank() > 1;
+
+      // Read offsets on CPU for control flow decisions.
+      StorageView offsets_cpu(DataType::INT32);
+      if (step_offsets.device() != Device::CPU)
+        offsets_cpu.copy_from(step_offsets.to(Device::CPU));
+      else
+        offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
+
+      const dim_t batch_size_raw = offsets_cpu.size();
+      dim_t min_step = offsets_cpu.at<int32_t>(0);
+      for (dim_t i = 1; i < batch_size_raw; ++i)
+        min_step = std::min(min_step, dim_t(offsets_cpu.at<int32_t>(i)));
+
+      StorageView layer_in(dtype, device);
+      StorageView layer_out(dtype, device);
+
+      _embeddings(ids, layer_in);
+      // _start_from_zero_embedding and _embeddings_scale are not used by Whisper.
+      // For generality, apply them based on min_step.
+      if (_start_from_zero_embedding)
+        zero_first_timestep(layer_in, min_step);
+      if (_embeddings_scale && (!_start_from_zero_embedding || min_step != 0))
+        ops::Mul()(layer_in, *_embeddings_scale, layer_in);
+      if (_project_in) {
+        (*_project_in)(layer_in, layer_out);
+        layer_in = std::move(layer_out);
+      }
+      if (layer_in.rank() == 2)
+        layer_in.expand_dims(1);
+
+      // Per-element position encoding.
+      if (_position_encoder)
+        (*_position_encoder)(layer_in, step_offsets);
+
+      if (_layernorm_embedding)
+        (*_layernorm_embedding)(layer_in, layer_in);
+
+      const dim_t batch_size = layer_in.dim(0);
+      const dim_t max_time = layer_in.dim(1);
+
+      const bool allow_padding_removal = Padder::allow_padding_removal(_device, _compute_type);
+
+      std::unique_ptr<const Padder> input_padder;
+      std::unique_ptr<const StorageView> input_lengths_val;
+      std::unique_ptr<const StorageView> input_lengths_mask;
+
+      bool multi_query = _layers.front()->get_self_attention().multi_query();
+
+      // Build per-element attention mask using cache_lengths from state if available.
+      // cache_lengths tracks valid (non-padded) cache entries per element.
+      const auto cache_lengths_it = state.find("cache_lengths");
+      if (cache_lengths_it != state.end()) {
+        dim_t num_heads = _num_heads;
+        if (_tensor_parallel)
+          num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
+
+        // cache_lengths: [batch_size] INT32 — valid cache entries per element.
+        // The attention mask should allow attending to cache_lengths[b] + time positions.
+        StorageView attn_lengths({batch_size}, DataType::INT32);
+        StorageView cl_cpu(DataType::INT32);
+        const StorageView& cl = cache_lengths_it->second;
+        if (cl.device() != Device::CPU)
+          cl_cpu.copy_from(cl.to(Device::CPU));
+        else
+          cl_cpu.shallow_copy(const_cast<StorageView&>(cl));
+
+        for (dim_t b = 0; b < batch_size; ++b)
+          attn_lengths.at<int32_t>(b) = cl_cpu.at<int32_t>(b) + max_time;
+
+        if (device != Device::CPU)
+          attn_lengths = attn_lengths.to(device);
+
+        // The mask has one entry per (batch, head, query) telling softmax how many
+        // key positions are valid.  num_queries = max_time (the query dimension,
+        // typically 1 during iterative decoding).  mask_future must be false so
+        // that each entry simply equals attn_lengths[b] rather than being clamped
+        // to min(attn_lengths[b], q+1).
+        StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
+          attn_lengths,
+          num_heads,
+          max_time,
+          /*mask_future=*/false,
+          multi_query);
+
+        input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
+      }
+
+      // Access encoder memory when any element needs cross-attention projection.
+      StorageView* memory = nullptr;
+      std::unique_ptr<const StorageView> memory_lengths_mask;
+      std::unique_ptr<const Padder> memory_padder;
+      if (_with_encoder_attention) {
+        const auto it = state.find("memory_lengths");
+        const StorageView* memory_lengths = it != state.end() ? &it->second : nullptr;
+
+        // In continuous batching, memory is needed when any element has step == 0.
+        if (min_step <= 0 && state.count("memory")) {
+          memory = &state.at("memory");
+
+          if (memory_lengths && allow_padding_removal) {
+            memory_padder = std::make_unique<Padder>(*memory_lengths, memory->dim(1));
+            memory_padder->remove_padding(*memory);
+          }
+        }
+
+        if (memory_lengths) {
+          dim_t num_heads = _num_heads;
+          if (_tensor_parallel)
+            num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
+          const dim_t beam_size = batch_size / memory_lengths->dim(0);
+          memory_lengths_mask = std::make_unique<StorageView>(
+            layers::MultiHeadAttention::prepare_length_mask(*memory_lengths,
+                                                            num_heads,
+                                                            beam_size > 1 ? beam_size : max_time));
+        }
+      }
+
+      std::vector<StorageView> alignment_heads;
+      if (attention)
+        alignment_heads.reserve(_layers.size());
+
+      StorageView position_bias(dtype, device);
+
+      // No sliding window chunking — Whisper doesn't use it.
+      for (size_t l = 0; l < _layers.size(); ++l) {
+        StorageView* cached_self_attn_keys = nullptr;
+        StorageView* cached_self_attn_values = nullptr;
+        StorageView* cached_attn_keys = nullptr;
+        StorageView* cached_attn_values = nullptr;
+
+        // In continuous batching all elements use cache (all offsets >= 0).
+        const std::string l_str = std::to_string(l);
+        cached_self_attn_keys = &state.at("self_keys_" + l_str);
+        cached_self_attn_values = &state.at("self_values_" + l_str);
+        if (_with_encoder_attention) {
+          cached_attn_keys = &state.at("memory_keys_" + l_str);
+          cached_attn_values = &state.at("memory_values_" + l_str);
+        }
+
+        std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
+        std::unique_ptr<StorageView> layer_attention;
+        if (attention && heads_to_select)
+          layer_attention = std::make_unique<StorageView>(dtype, device);
+
+        // offset=0 for per-element (position already encoded via per-element offsets).
+        (*_layers[l])(layer_in,
+                      input_lengths_mask.get(),
+                      memory,
+                      memory_lengths_mask.get(),
+                      cached_self_attn_keys,
+                      cached_self_attn_values,
+                      cached_attn_keys,
+                      cached_attn_values,
+                      layer_out,
+                      layer_attention.get(),
+                      input_padder.get(),
+                      memory_padder.get(),
+                      return_normalized_attention(),
+                      &position_bias,
+                      /*offset=*/0);
+        layer_in = std::move(layer_out);
+
+        if (layer_attention) {
+          alignment_heads.emplace_back(dtype, device);
+          ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
+        }
+      }
+
+      // In continuous batching mode, do not erase memory.
+      if (retain_memory) {
+        state["_retain_memory"] = StorageView();  // marker
+      }
+
+      if (attention && !alignment_heads.empty()) {
+        if (_average_alignment_heads) {
+          ops::Mean(1)(alignment_heads[0], *attention);
+          if (!is_sequence)
+            attention->squeeze(1);
+        } else {
+          std::vector<const StorageView*> alignment_heads_ptr;
+          alignment_heads_ptr.reserve(alignment_heads.size());
+          for (const auto& heads : alignment_heads)
+            alignment_heads_ptr.emplace_back(&heads);
           ops::Concat(1)(alignment_heads_ptr, *attention);
           if (!is_sequence)
             attention->squeeze(2);

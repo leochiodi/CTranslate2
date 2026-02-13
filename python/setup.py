@@ -47,7 +47,10 @@ package_data = {}
 if sys.platform == "darwin":
     # std::visit requires macOS 10.14
     cflags.append("-mmacosx-version-min=10.14")
+    # @loader_path lets the .so find libctranslate2 next to itself
+    ldflags.append("-Wl,-rpath,@loader_path")
     ldflags.append("-Wl,-rpath,/usr/local/lib")
+    package_data["ctranslate2"] = ["*.dylib"]
 elif sys.platform == "win32":
     cflags = ["/std:c++17", "/d2FH4-"]
     package_data["ctranslate2"] = ["*.dll"]

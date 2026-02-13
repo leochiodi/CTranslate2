@@ -69,6 +69,23 @@ namespace ctranslate2 {
       return true;
     }
 
+    void Decoder::operator()(const StorageView& step_offsets,
+                             const StorageView& ids,
+                             DecoderState& state,
+                             StorageView* logits,
+                             StorageView* attention) {
+      // Default implementation: fall back to scalar step if all offsets are equal.
+      // Subclasses (TransformerDecoder) override this with true per-element support.
+      StorageView offsets_cpu(DataType::INT32);
+      if (step_offsets.device() != Device::CPU)
+        offsets_cpu.copy_from(step_offsets.to(Device::CPU));
+      else
+        offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
+
+      const dim_t step0 = offsets_cpu.at<int32_t>(0);
+      (*this)(step0, ids, state, logits, attention);
+    }
+
     void Decoder::update_output_layer(const dim_t size_multiple,
                                       const std::vector<size_t>& restrict_ids) {
       const dim_t current_output_size = output_size();

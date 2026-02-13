@@ -1,9 +1,18 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
+
+#include "ctranslate2/continuous_decoding.h"
 #include "ctranslate2/generation.h"
 #include "ctranslate2/layers/whisper.h"
 #include "ctranslate2/models/model.h"
 #include "ctranslate2/replica_pool.h"
+#include "ctranslate2/sampling.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -185,6 +194,113 @@ namespace ctranslate2 {
             std::vector<size_t> num_frames,
             dim_t median_filter_width);
 
+    };
+
+    // Continuous batching engine for Whisper.
+    //
+    // Runs a background worker thread that consumes a queue of transcription
+    // requests. Each request gets a "slot" in a persistent decode batch.
+    // When a slot finishes (EOT or max_length), its result is stored and
+    // the slot is recycled for the next queued request.
+    //
+    // Usage:
+    //   WhisperContinuousBatcher batcher(model_path, /*max_slots=*/4);
+    //   batcher.start();
+    //   size_t id = batcher.submit(features, prompt);
+    //   auto result = batcher.get_result(id);  // blocks until ready
+    //   batcher.stop();
+    class WhisperContinuousBatcher {
+    public:
+      WhisperContinuousBatcher(
+        const std::string& model_path,
+        size_t max_slots,
+        const WhisperOptions& default_options = {},
+        Device device = Device::CUDA,
+        int device_index = 0,
+        ComputeType compute_type = ComputeType::DEFAULT);
+
+      ~WhisperContinuousBatcher();
+
+      // Non-copyable, non-movable.
+      WhisperContinuousBatcher(const WhisperContinuousBatcher&) = delete;
+      WhisperContinuousBatcher& operator=(const WhisperContinuousBatcher&) = delete;
+
+      // Submit a request. Thread-safe, can be called from any thread.
+      // features: [1, n_mels, T] audio features (raw or pre-encoded).
+      // prompt: full prompt token IDs (e.g. [sot, lang, task, notimestamps]).
+      // Returns a unique request ID.
+      size_t submit(StorageView features, std::vector<size_t> prompt);
+
+      // Block until the result for request_id is ready, then return it.
+      WhisperGenerationResult get_result(size_t request_id);
+
+      // Non-blocking check if a result is ready.
+      bool is_ready(size_t request_id) const;
+
+      // Start the background worker thread.
+      void start();
+
+      // Signal stop and join the worker thread.
+      // Completes any in-flight decode batch before returning.
+      void stop();
+
+      // Synchronous operations using a dedicated replica (thread-safe with worker_loop).
+      StorageView encode(StorageView features, bool to_cpu = false);
+
+      std::vector<std::vector<std::pair<std::string, float>>>
+      detect_language(StorageView features);
+
+      std::vector<WhisperAlignmentResult>
+      align(StorageView features,
+            const std::vector<size_t>& start_sequence,
+            const std::vector<std::vector<size_t>>& text_tokens,
+            std::vector<size_t> num_frames,
+            dim_t median_filter_width = 7);
+
+      bool is_multilingual() const;
+
+    private:
+      std::shared_ptr<const WhisperModel> _model;
+      std::unique_ptr<layers::WhisperEncoder> _encoder;
+      std::unique_ptr<layers::WhisperDecoder> _decoder;
+
+      size_t _max_slots;
+      WhisperOptions _options;
+
+      size_t _sot_id;
+      size_t _eot_id;
+      size_t _no_timestamps_id;
+      size_t _no_speech_id;
+
+      // Internal request type (carries raw features).
+      struct Request {
+        size_t id;
+        StorageView features;
+        std::vector<size_t> prompt;
+      };
+
+      // Thread-safe request queue.
+      std::queue<Request> _queue;
+      mutable std::mutex _queue_mutex;
+      std::condition_variable _queue_cv;
+
+      // Results storage.
+      std::unordered_map<size_t, WhisperGenerationResult> _results;
+      mutable std::mutex _results_mutex;
+      std::condition_variable _results_cv;
+
+      // Worker thread.
+      std::thread _worker;
+      std::atomic<bool> _running{false};
+      std::atomic<size_t> _next_id{0};
+
+      // Dedicated replica for synchronous methods (encode/detect_language/align).
+      // Shares model weights with the batcher but has its own encoder/decoder,
+      // so concurrent use with worker_loop is safe.
+      std::unique_ptr<WhisperReplica> _replica;
+      mutable std::mutex _replica_mutex;
+
+      void worker_loop();
     };
 
   }

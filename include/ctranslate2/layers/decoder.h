@@ -29,6 +29,14 @@ namespace ctranslate2 {
                               StorageView* logits = nullptr,
                               StorageView* attention = nullptr) = 0;
 
+      // Forwards one step with per-element step offsets (for continuous batching).
+      // step_offsets: [batch_size] INT32, each value is the decode step for that element.
+      virtual void operator()(const StorageView& step_offsets,
+                              const StorageView& ids,
+                              DecoderState& state,
+                              StorageView* logits = nullptr,
+                              StorageView* attention = nullptr);
+
       // Forwards a full sequence.
       virtual void operator()(const StorageView& ids,
                               const StorageView& lengths,

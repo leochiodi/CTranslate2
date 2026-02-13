@@ -122,6 +122,7 @@ set(SOURCES
   src/cpu/kernels.cc
   src/cpu/parallel.cc
   src/cpu/primitives.cc
+  src/continuous_decoding.cc
   src/decoding.cc
   src/decoding_utils.cc
   src/devices.cc
@@ -229,6 +230,7 @@ set(SOURCES
 )
 set(CUDA_SOURCES
   src/cuda/allocator.cc
+  src/cuda/batch_copy.cu
   src/cuda/primitives.cu
   src/cuda/random.cu
   src/cuda/utils.cc

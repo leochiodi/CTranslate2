@@ -91,6 +91,9 @@ namespace ctranslate2 {
     public:
       void operator()(StorageView& input, dim_t index = 0);
       void operator()(const StorageView& input, StorageView& output, dim_t index = 0);
+      // Per-element position offsets for continuous batching.
+      // offsets: [batch_size] INT32, each value is the step offset for that batch element.
+      void operator()(StorageView& input, const StorageView& offsets);
     protected:
       virtual const StorageView& get_position_encoding(dim_t max_time) = 0;
     };

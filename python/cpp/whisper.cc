@@ -114,6 +114,109 @@ namespace ctranslate2 {
     };
 
 
+    class WhisperContinuousBatcherWrapper {
+    public:
+      WhisperContinuousBatcherWrapper(
+          const std::string& model_path,
+          size_t max_slots,
+          const std::string& device,
+          int device_index,
+          const std::string& compute_type,
+          size_t beam_size,
+          float patience,
+          float length_penalty,
+          float repetition_penalty,
+          size_t no_repeat_ngram_size,
+          size_t max_length,
+          size_t sampling_topk,
+          float sampling_temperature,
+          bool suppress_blank,
+          const std::optional<std::vector<int>>& suppress_tokens,
+          size_t max_initial_timestamp_index) {
+        models::WhisperOptions options;
+        options.beam_size = beam_size;
+        options.patience = patience;
+        options.length_penalty = length_penalty;
+        options.repetition_penalty = repetition_penalty;
+        options.no_repeat_ngram_size = no_repeat_ngram_size;
+        options.max_length = max_length;
+        options.sampling_topk = sampling_topk;
+        options.sampling_temperature = sampling_temperature;
+        options.suppress_blank = suppress_blank;
+        options.max_initial_timestamp_index = max_initial_timestamp_index;
+
+        if (suppress_tokens)
+          options.suppress_tokens = suppress_tokens.value();
+        else
+          options.suppress_tokens.clear();
+
+        _batcher = std::make_unique<models::WhisperContinuousBatcher>(
+          model_path,
+          max_slots,
+          options,
+          str_to_device(device),
+          device_index,
+          str_to_compute_type(compute_type));
+      }
+
+      size_t submit(const StorageView& features, Ids prompt) {
+        return _batcher->submit(features.sync_copy(), std::move(prompt));
+      }
+
+      models::WhisperGenerationResult get_result(size_t request_id) {
+        return _batcher->get_result(request_id);
+      }
+
+      bool is_ready(size_t request_id) const {
+        return _batcher->is_ready(request_id);
+      }
+
+      void start() {
+        _batcher->start();
+      }
+
+      void stop() {
+        _batcher->stop();
+      }
+
+      bool is_multilingual() const {
+        return _batcher->is_multilingual();
+      }
+
+      StorageView encode(const StorageView& features, bool to_cpu) {
+        return _batcher->encode(features.sync_copy(), to_cpu);
+      }
+
+      std::vector<std::vector<std::pair<std::string, float>>>
+      detect_language(const StorageView& features) {
+        return _batcher->detect_language(features.sync_copy());
+      }
+
+      std::vector<models::WhisperAlignmentResult>
+      align(const StorageView& features,
+            Ids start_sequence,
+            BatchIds text_tokens,
+            const std::variant<size_t, std::vector<size_t>>& num_frames,
+            size_t median_filter_width) {
+        const size_t batch_size = text_tokens.size();
+        std::vector<size_t> batch_num_frames;
+        if (num_frames.index() == 0)
+          batch_num_frames.resize(batch_size, std::get<size_t>(num_frames));
+        else
+          batch_num_frames = std::get<std::vector<size_t>>(num_frames);
+
+        return _batcher->align(features.sync_copy(),
+                               std::move(start_sequence),
+                               std::move(text_tokens),
+                               std::move(batch_num_frames),
+                               median_filter_width);
+      }
+
+    private:
+      std::unique_ptr<models::WhisperContinuousBatcher> _batcher;
+    };
+
+
     void register_whisper(py::module& m) {
       py::class_<models::WhisperGenerationResult>(m, "WhisperGenerationResult",
                                                   "A generation result from the Whisper model.")
@@ -364,6 +467,173 @@ namespace ctranslate2 {
 
         .def_property_readonly("model_is_loaded", &WhisperWrapper::model_is_loaded,
                                "Whether the model is loaded on the initial device and ready to be used.")
+        ;
+
+      py::class_<WhisperContinuousBatcherWrapper>(
+        m, "WhisperContinuousBatcher",
+        R"pbdoc(
+            Continuous batching engine for Whisper.
+
+            Runs a background worker thread that processes transcription requests
+            from a queue. When a decode slot finishes, it is recycled for the next
+            queued request, maximizing GPU utilization.
+
+            Example::
+
+                batcher = ctranslate2.WhisperContinuousBatcher(model_path, max_slots=4, device="cuda")
+                batcher.start()
+                req_id = batcher.submit(features, prompt_ids)
+                result = batcher.get_result(req_id)  # blocks until ready
+                batcher.stop()
+        )pbdoc")
+
+        .def(py::init<const std::string&, size_t, const std::string&, int, const std::string&,
+                       size_t, float, float, float, size_t, size_t, size_t, float, bool,
+                       const std::optional<std::vector<int>>&, size_t>(),
+             py::arg("model_path"),
+             py::arg("max_slots"),
+             py::arg("device")="cuda",
+             py::kw_only(),
+             py::arg("device_index")=0,
+             py::arg("compute_type")="default",
+             py::arg("beam_size")=5,
+             py::arg("patience")=1,
+             py::arg("length_penalty")=1,
+             py::arg("repetition_penalty")=1,
+             py::arg("no_repeat_ngram_size")=0,
+             py::arg("max_length")=448,
+             py::arg("sampling_topk")=1,
+             py::arg("sampling_temperature")=1,
+             py::arg("suppress_blank")=true,
+             py::arg("suppress_tokens")=std::vector<int>{-1},
+             py::arg("max_initial_timestamp_index")=50,
+             R"pbdoc(
+                 Initializes a continuous batching Whisper engine.
+
+                 Arguments:
+                   model_path: Path to the CTranslate2 model directory.
+                   max_slots: Maximum number of concurrent decode slots.
+                   device: Device to use (possible values are: cpu, cuda, auto).
+                   device_index: Device ID where to place this model on.
+                   compute_type: Model computation type.
+                   beam_size: Beam size (1 for greedy search).
+                   patience: Beam search patience factor.
+                   length_penalty: Exponential penalty applied to the length during beam search.
+                   repetition_penalty: Penalty applied to the score of previously generated tokens.
+                   no_repeat_ngram_size: Prevent repetitions of ngrams with this size.
+                   max_length: Maximum generation length.
+                   sampling_topk: Randomly sample predictions from the top K candidates.
+                   sampling_temperature: Sampling temperature to generate more random samples.
+                   suppress_blank: Suppress blank outputs at the beginning of the sampling.
+                   suppress_tokens: List of token IDs to suppress.
+                   max_initial_timestamp_index: Maximum index of the first predicted timestamp.
+             )pbdoc")
+
+        .def("submit", &WhisperContinuousBatcherWrapper::submit,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Submits a transcription request.
+
+                 Arguments:
+                   features: Mel spectrogram of the audio, as a float array with shape
+                     ``[1, n_mels, chunk_length]``.
+                   prompt: Prompt token IDs (e.g. ``[sot_id, lang_id, task_id, notimestamps_id]``).
+
+                 Returns:
+                   A unique request ID.
+             )pbdoc")
+
+        .def("get_result", &WhisperContinuousBatcherWrapper::get_result,
+             py::arg("request_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Blocks until the result for the given request ID is ready, then returns it.
+
+                 Arguments:
+                   request_id: The request ID returned by :meth:`submit`.
+
+                 Returns:
+                   A WhisperGenerationResult.
+             )pbdoc")
+
+        .def("is_ready", &WhisperContinuousBatcherWrapper::is_ready,
+             py::arg("request_id"),
+             R"pbdoc(
+                 Non-blocking check if a result is ready.
+
+                 Arguments:
+                   request_id: The request ID returned by :meth:`submit`.
+
+                 Returns:
+                   ``True`` if the result is available.
+             )pbdoc")
+
+        .def("start", &WhisperContinuousBatcherWrapper::start,
+             R"pbdoc(
+                 Starts the background worker thread.
+             )pbdoc")
+
+        .def("stop", &WhisperContinuousBatcherWrapper::stop,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Signals the worker to stop and waits for it to finish.
+                 Completes any in-flight decode batch before returning.
+             )pbdoc")
+
+        .def_property_readonly("is_multilingual", &WhisperContinuousBatcherWrapper::is_multilingual,
+                               "Returns ``True`` if this model is multilingual.")
+
+        .def("encode", &WhisperContinuousBatcherWrapper::encode,
+             py::arg("features"), py::arg("to_cpu")=false,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Encodes the input features using the dedicated replica.
+
+                 Arguments:
+                   features: Mel spectogram of the audio, as a float array with shape
+                     ``[batch_size, n_mels, chunk_length]``.
+                   to_cpu: Copy the encoder output to the CPU before returning the value.
+
+                 Returns:
+                   The encoder output.
+             )pbdoc")
+
+        .def("detect_language", &WhisperContinuousBatcherWrapper::detect_language,
+             py::arg("features"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Returns the probability of each language using the dedicated replica.
+
+                 Arguments:
+                   features: Mel spectogram of the audio, as a float array with shape
+                     ``[batch_size, n_mels, chunk_length]``.
+
+                 Returns:
+                   For each batch, a list of pairs (language, probability) ordered from
+                   best to worst probability.
+             )pbdoc")
+
+        .def("align", &WhisperContinuousBatcherWrapper::align,
+             py::arg("features"), py::arg("start_sequence"),
+             py::arg("text_tokens"), py::arg("num_frames"),
+             py::kw_only(), py::arg("median_filter_width")=7,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Computes the alignments between text tokens and audio using the dedicated replica.
+
+                 Arguments:
+                   features: Mel spectogram of the audio, as a float array with shape
+                     ``[batch_size, n_mels, chunk_length]``.
+                   start_sequence: The start sequence tokens.
+                   text_tokens: Batch of text tokens to align.
+                   num_frames: Number of non padding frames in the features.
+                   median_filter_width: Width of the median filter kernel.
+
+                 Returns:
+                   A list of alignment results.
+             )pbdoc")
         ;
     }
 

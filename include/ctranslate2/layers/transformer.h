@@ -178,6 +178,11 @@ namespace ctranslate2 {
                       DecoderState& state,
                       StorageView* logits = nullptr,
                       StorageView* attention = nullptr) override;
+      void operator()(const StorageView& step_offsets,
+                      const StorageView& ids,
+                      DecoderState& state,
+                      StorageView* logits = nullptr,
+                      StorageView* attention = nullptr) override;
       void operator()(const StorageView& ids,
                       const StorageView& lengths,
                       DecoderState& state,
@@ -206,6 +211,16 @@ namespace ctranslate2 {
                   StorageView* outputs = nullptr,
                   StorageView* attention = nullptr,
                   bool return_logits = true);
+
+      // Per-element step offsets variant for continuous batching.
+      void decode(const StorageView& ids,
+                  const StorageView* lengths,
+                  const StorageView& step_offsets,
+                  DecoderState& state,
+                  StorageView* outputs = nullptr,
+                  StorageView* attention = nullptr,
+                  bool return_logits = true,
+                  bool retain_memory = false);
 
       const dim_t _num_heads;
       const ComputeType _compute_type;
