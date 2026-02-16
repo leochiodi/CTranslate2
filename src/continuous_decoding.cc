@@ -575,14 +575,14 @@ namespace ctranslate2 {
       }
     }
 
-    // Set cache_lengths.
-    batch_state["cache_lengths"] = StorageView({total_batch}, int32_t(0), device);
+    // Set cache_lengths (build on CPU, then move to device).
     {
-      auto& cl = batch_state["cache_lengths"];
+      StorageView cl_cpu({total_batch}, int32_t(0));
       for (size_t s = 0; s < initial_slots.size(); ++s) {
         for (dim_t b = 0; b < _beam_size; ++b)
-          cl.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = initial_slots[s].prompt_length;
+          cl_cpu.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = initial_slots[s].prompt_length;
       }
+      batch_state["cache_lengths"] = cl_cpu.to(device);
     }
 
     // Set slot states.

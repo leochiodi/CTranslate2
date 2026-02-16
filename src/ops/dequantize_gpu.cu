@@ -3,6 +3,13 @@
 #include "cuda/helpers.h"
 
 namespace ctranslate2 {
+
+  namespace {
+    template <typename T>
+    struct identity_func {
+      __device__ __host__ __forceinline__ T operator()(const T& x) const { return x; }
+    };
+  }
   namespace ops {
 
     template <typename InT, typename OutT>
@@ -69,7 +76,7 @@ namespace ctranslate2 {
 
       if (!activation_type) {
         dequantize_gemm_output_kernel<<<blocks, threads, 0, cuda::get_cuda_stream()>>>(
-          c, a_scales, b_scales, transpose_a, transpose_b, bias, thrust::identity<T>(), y, depth);
+          c, a_scales, b_scales, transpose_a, transpose_b, bias, identity_func<T>(), y, depth);
 
       } else {
         switch (*activation_type) {

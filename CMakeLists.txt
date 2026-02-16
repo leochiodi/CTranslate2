@@ -544,9 +544,9 @@ if (WITH_CUDA)
   list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
   set(CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
 
+  list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
   # flags for flash attention
   if (WITH_FLASH_ATTN)
-    list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
     list(APPEND CUDA_NVCC_FLAGS "--expt-extended-lambda")
   endif()
 
