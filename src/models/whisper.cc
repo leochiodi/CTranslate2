@@ -1042,22 +1042,21 @@ namespace ctranslate2 {
         }
 
         // Process the batch. queue_provider allows mid-decode slot filling.
-        auto results = engine.process(local_queue, queue_provider);
-
-        // Convert and store results.
-        {
-          std::lock_guard<std::mutex> lock(_results_mutex);
-          for (auto& cr : results) {
+        // Results are delivered incrementally via callback as each slot completes.
+        engine.process(local_queue, queue_provider,
+          [this, &vocabulary](ContinuousResult cr) {
             WhisperGenerationResult wr;
             wr.sequences = vocabulary.to_tokens(cr.result.hypotheses);
             wr.sequences_ids = std::move(cr.result.hypotheses);
             wr.scores = std::move(cr.result.scores);
             if (cr.attention_weights)
               wr.attention_weights = std::move(cr.attention_weights);
-            _results[cr.request_id] = std::move(wr);
-          }
-        }
-        _results_cv.notify_all();
+            {
+              std::lock_guard<std::mutex> lock(_results_mutex);
+              _results[cr.request_id] = std::move(wr);
+            }
+            _results_cv.notify_all();
+          });
       }
 
       // Synchronize CUDA stream before local objects (engine, tensors) are destroyed,

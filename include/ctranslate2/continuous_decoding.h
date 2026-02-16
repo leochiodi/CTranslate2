@@ -136,6 +136,9 @@ namespace ctranslate2 {
   // Must be thread-safe (caller provides locking).
   using QueueProvider = std::function<std::optional<ContinuousRequest>()>;
 
+  // Callback invoked when a slot completes, delivering the result immediately.
+  using ResultCallback = std::function<void(ContinuousResult)>;
+
   // Continuous batching decode engine.
   //
   // Instead of decoding a fixed batch until all elements finish,
@@ -169,12 +172,15 @@ namespace ctranslate2 {
         std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors = {},
         bool capture_attention = false);
 
-    // Process requests from the queue. Returns results for completed requests.
+    // Process requests from the queue.
     // queue_provider: optional callback to pull additional requests mid-decode
     //   (e.g. from a thread-safe shared queue).
-    std::vector<ContinuousResult> process(
+    // result_callback: invoked immediately when each slot completes, delivering
+    //   results incrementally instead of waiting for all slots to drain.
+    void process(
         std::queue<ContinuousRequest>& request_queue,
-        QueueProvider queue_provider = nullptr);
+        QueueProvider queue_provider = nullptr,
+        ResultCallback result_callback = nullptr);
 
   private:
     layers::Decoder& _decoder;

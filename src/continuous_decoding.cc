@@ -441,18 +441,18 @@ namespace ctranslate2 {
     return true;
   }
 
-  std::vector<ContinuousResult> ContinuousDecodingEngine::process(
+  void ContinuousDecodingEngine::process(
       std::queue<ContinuousRequest>& request_queue,
-      QueueProvider queue_provider) {
+      QueueProvider queue_provider,
+      ResultCallback result_callback) {
     if (request_queue.empty() && (!queue_provider || !queue_provider().has_value()))
-      return {};
+      return;
 
     const Device device = _decoder.device();
     const DataType dtype = _decoder.output_type();
     const dim_t total_batch = static_cast<dim_t>(_max_slots) * _beam_size;
 
     std::vector<SlotState> slots(_max_slots);
-    std::vector<ContinuousResult> results;
 
     // ---- Batched initial fill ----
     // Collect initial requests, process each independently (encode + forward_prompt),
@@ -484,7 +484,7 @@ namespace ctranslate2 {
     }
 
     if (initial_slots.empty())
-      return results;
+      return;
 
     // Process each request: encode + forward_prompt + beam replication.
     dim_t max_prompt_len = 0;
@@ -614,7 +614,7 @@ namespace ctranslate2 {
     }
 
     if (active_count == 0)
-      return results;
+      return;
 
     // Build sample_from for ALL batch rows (always total_batch elements).
     StorageView sample_from({total_batch}, DataType::INT32);
@@ -765,7 +765,7 @@ namespace ctranslate2 {
               }
             }
 
-            results.push_back(std::move(cr));
+            if (result_callback) result_callback(std::move(cr));
 
             slots[s].active = false;
             finished_slots.push_back(s);
@@ -948,7 +948,7 @@ namespace ctranslate2 {
               }
             }
 
-            results.push_back(std::move(cr));
+            if (result_callback) result_callback(std::move(cr));
 
             slot.active = false;
             finished_slots.push_back(s);
@@ -1060,7 +1060,6 @@ namespace ctranslate2 {
     // freed while kernels are still in-flight.
     synchronize_stream(device);
 
-    return results;
   }
 
 }
