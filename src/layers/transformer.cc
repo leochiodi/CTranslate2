@@ -861,8 +861,12 @@ namespace ctranslate2 {
       const bool is_sequence = ids.rank() > 1;
 
       // Read offsets on CPU for control flow decisions.
+      // Check batch_state for pre-computed CPU copy to avoid GPU→CPU sync.
       StorageView offsets_cpu(DataType::INT32);
-      if (step_offsets.device() != Device::CPU)
+      const auto step_offsets_cpu_it = state.find("step_offsets_cpu");
+      if (step_offsets_cpu_it != state.end())
+        offsets_cpu.shallow_copy(step_offsets_cpu_it->second);
+      else if (step_offsets.device() != Device::CPU)
         offsets_cpu.copy_from(step_offsets.to(Device::CPU));
       else
         offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
@@ -915,18 +919,13 @@ namespace ctranslate2 {
         if (_tensor_parallel)
           num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
 
-        // cache_lengths: [batch_size] INT32 — valid cache entries per element.
+        // cache_lengths: [batch_size] INT32 on CPU — valid cache entries per element.
         // The attention mask should allow attending to cache_lengths[b] + time positions.
         StorageView attn_lengths({batch_size}, DataType::INT32);
-        StorageView cl_cpu(DataType::INT32);
         const StorageView& cl = cache_lengths_it->second;
-        if (cl.device() != Device::CPU)
-          cl_cpu.copy_from(cl.to(Device::CPU));
-        else
-          cl_cpu.shallow_copy(const_cast<StorageView&>(cl));
 
         for (dim_t b = 0; b < batch_size; ++b)
-          attn_lengths.at<int32_t>(b) = cl_cpu.at<int32_t>(b) + max_time;
+          attn_lengths.at<int32_t>(b) = cl.at<int32_t>(b) + max_time;
 
         if (device != Device::CPU)
           attn_lengths = attn_lengths.to(device);

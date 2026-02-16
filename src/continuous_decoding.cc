@@ -404,23 +404,14 @@ namespace ctranslate2 {
       }
 
       batch_state = std::move(single_state);
-      batch_state["cache_lengths"] = StorageView({total_batch}, int32_t(0), device);
+      batch_state["cache_lengths"] = StorageView({total_batch}, int32_t(0));  // CPU: avoid GPU sync roundtrips
     }
 
-    // Update cache_lengths for this slot's rows.
+    // Update cache_lengths for this slot's rows (always on CPU).
     auto& cache_lengths = batch_state["cache_lengths"];
     if (cache_lengths) {
-      if (cache_lengths.device() == Device::CPU) {
-        // Write directly — no shallow_copy/move dance (which causes use-after-free).
-        for (dim_t b = 0; b < _beam_size; ++b)
-          cache_lengths.at<int32_t>(slot_idx * _beam_size + b) = prompt_length;
-      } else {
-        StorageView cl_cpu(DataType::INT32);
-        cl_cpu.copy_from(cache_lengths.to(Device::CPU));
-        for (dim_t b = 0; b < _beam_size; ++b)
-          cl_cpu.at<int32_t>(slot_idx * _beam_size + b) = prompt_length;
-        cache_lengths = cl_cpu.to(cache_lengths.device());
-      }
+      for (dim_t b = 0; b < _beam_size; ++b)
+        cache_lengths.at<int32_t>(slot_idx * _beam_size + b) = prompt_length;
     }
 
     // Set slot state.
@@ -593,7 +584,7 @@ namespace ctranslate2 {
         for (dim_t b = 0; b < _beam_size; ++b)
           cl_cpu.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = initial_slots[s].prompt_length;
       }
-      batch_state["cache_lengths"] = cl_cpu.to(device);
+      batch_state["cache_lengths"] = std::move(cl_cpu);  // Keep on CPU to avoid GPU sync roundtrips
     }
 
     // Set slot states.
@@ -653,7 +644,7 @@ namespace ctranslate2 {
       if (active_count == 0)
         break;
 
-      // Build step_offsets for ALL batch rows.
+      // Build step_offsets for ALL batch rows (on CPU).
       StorageView step_offsets({total_batch}, DataType::INT32);
       for (size_t s = 0; s < _max_slots; ++s) {
         const int32_t step_val = slots[s].active ? slots[s].step : 0;
@@ -661,41 +652,42 @@ namespace ctranslate2 {
           step_offsets.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = step_val;
       }
 
+      // Store CPU step_offsets in batch_state so transformer.cc can skip GPU→CPU copy.
+      batch_state["step_offsets_cpu"] = step_offsets;
+
       if (device != Device::CPU)
         step_offsets = step_offsets.to(device);
 
-      // Pre-expand self-attention caches if any row's write position would exceed cache time.
+      // Expand self-attention caches if any row's write position would exceed cache time.
       // Also set cache_write_positions for scatter-based writes.
       {
+        // cache_lengths is kept on CPU to avoid GPU sync roundtrips.
         const auto& cache_lengths = batch_state["cache_lengths"];
         const dim_t current_cache_time = max_cache_length(batch_state);
 
-        // Read cache_lengths on CPU.
-        StorageView cl_cpu(DataType::INT32);
-        if (cache_lengths.device() != Device::CPU)
-          cl_cpu.copy_from(cache_lengths.to(Device::CPU));
-        else
-          cl_cpu.shallow_copy(const_cast<StorageView&>(cache_lengths));
-
         dim_t max_cl = 0;
-        for (dim_t i = 0; i < cl_cpu.size(); ++i)
-          max_cl = std::max(max_cl, dim_t(cl_cpu.at<int32_t>(i)));
+        for (dim_t i = 0; i < cache_lengths.size(); ++i)
+          max_cl = std::max(max_cl, dim_t(cache_lengths.at<int32_t>(i)));
 
         if (max_cl >= current_cache_time) {
+          // Grow in chunks to avoid per-step concat overhead.
+          // Round up to next multiple of chunk_size (or _max_length, whichever is smaller).
+          constexpr dim_t chunk_size = 64;
+          const dim_t target = std::min(
+            ((max_cl / chunk_size) + 1) * chunk_size,
+            _max_length);
           for (auto& [name, value] : batch_state) {
             if (name.find("self_keys_") != std::string::npos
                 || name.find("self_values_") != std::string::npos) {
-              pad_cache(value, current_cache_time + 1, /*time_dim=*/2);
+              pad_cache(value, target, /*time_dim=*/2);
             }
           }
         }
 
-        // Set cache_write_positions = cache_lengths (scatter at each row's position).
-        if (cache_lengths.device() == device) {
-          batch_state["cache_write_positions"] = cache_lengths;
-        } else {
-          batch_state["cache_write_positions"] = cache_lengths.to(device);
-        }
+        // Set cache_write_positions = cache_lengths (CPU).
+        // scatter_cache_step reads positions on CPU to build copy descriptors,
+        // so passing CPU positions avoids 8 GPU→CPU syncs per step (4 layers × K+V).
+        batch_state["cache_write_positions"] = cache_lengths;
       }
 
       // Run one decode step.
@@ -703,8 +695,9 @@ namespace ctranslate2 {
       _decoder(step_offsets, sample_from.to(device), batch_state, &logits,
                _capture_attention ? &step_attention : nullptr);
 
-      // Remove cache_write_positions after the decode step.
+      // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");
+      batch_state.erase("step_offsets_cpu");
 
       // Accumulate cross-attention weights per step.
       // step_attention: [total_batch, num_alignment_heads, enc_time] (3D, after squeeze in decoder).
@@ -794,17 +787,23 @@ namespace ctranslate2 {
       } else {
         // --- Beam search path (beam_size > 1) ---
 
-        // Compute log_softmax.
+        // Compute log_softmax, then GPU TopK to avoid transferring full vocab to CPU.
         StorageView log_probs(logits.dtype(), logits.device());
         ops::LogSoftMax()(logits, log_probs);
 
-        // Move log_probs to CPU for per-slot beam selection.
-        if (log_probs.dtype() != DataType::FLOAT32)
-          log_probs = log_probs.to_float32();
-        if (log_probs.device() != Device::CPU)
-          log_probs = log_probs.to(Device::CPU);
+        // GPU TopK: extract top 2*beam_size candidates per row,
+        // transfer only [total_batch, 2*beam_size] to CPU instead of full vocab.
+        const dim_t topk_k = 2 * _beam_size;
+        StorageView topk_values(log_probs.dtype(), log_probs.device());
+        StorageView topk_indices(DataType::INT32, log_probs.device());
+        const ops::TopK topk_op(topk_k);
+        topk_op(log_probs, topk_values, topk_indices);
 
-        const dim_t vocab_size = log_probs.dim(1);
+        if (topk_values.dtype() != DataType::FLOAT32)
+          topk_values = topk_values.to_float32();
+        topk_values = topk_values.to(Device::CPU);
+        topk_indices = topk_indices.to(Device::CPU);
+
         StorageView gather_indices({total_batch}, DataType::INT32);
 
         // Initialize gather_indices to identity (inactive slots keep their rows).
@@ -824,30 +823,20 @@ namespace ctranslate2 {
             float score;
           };
           std::vector<Candidate> candidates;
-          candidates.reserve(_beam_size * 2 * _beam_size);
+          candidates.reserve(_beam_size * topk_k);
 
           for (dim_t b = 0; b < _beam_size; ++b) {
             if (slot.beam_finished[b])
               continue;
 
-            const float* row_probs = log_probs.index<float>({s_offset + b, 0});
+            const float* row_values = topk_values.index<float>({s_offset + b, 0});
+            const int32_t* row_indices = topk_indices.index<int32_t>({s_offset + b, 0});
             const float beam_score = slot.beam_scores[b];
 
-            // Find top 2*beam_size candidates from this beam.
-            std::vector<std::pair<float, size_t>> beam_candidates;
-            beam_candidates.reserve(vocab_size);
-            for (dim_t v = 0; v < vocab_size; ++v)
-              beam_candidates.emplace_back(beam_score + row_probs[v], v);
-
-            std::partial_sort(beam_candidates.begin(),
-                              beam_candidates.begin() + std::min(static_cast<dim_t>(2 * _beam_size),
-                                                                  vocab_size),
-                              beam_candidates.end(),
-                              [](const auto& a, const auto& b) { return a.first > b.first; });
-
-            for (dim_t k = 0; k < std::min(static_cast<dim_t>(2 * _beam_size), vocab_size); ++k) {
-              candidates.push_back(Candidate{b, beam_candidates[k].second,
-                                             beam_candidates[k].first});
+            // Candidates already sorted by GPU TopK — just iterate.
+            for (dim_t k = 0; k < topk_k; ++k) {
+              candidates.push_back(Candidate{b, static_cast<size_t>(row_indices[k]),
+                                             beam_score + row_values[k]});
             }
           }
 
@@ -1052,28 +1041,17 @@ namespace ctranslate2 {
         }
       }
 
-      // Update cache_lengths for active slots.
+      // Update cache_lengths for active slots (always on CPU, no GPU sync needed).
       auto& cache_lengths = batch_state["cache_lengths"];
       if (cache_lengths) {
-        if (cache_lengths.device() == Device::CPU) {
-          for (size_t s = 0; s < _max_slots; ++s) {
-            if (slots[s].active) {
-              for (dim_t b = 0; b < _beam_size; ++b)
-                cache_lengths.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = slots[s].step;
-            }
+        for (size_t s = 0; s < _max_slots; ++s) {
+          if (slots[s].active) {
+            for (dim_t b = 0; b < _beam_size; ++b)
+              cache_lengths.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = slots[s].step;
           }
-        } else {
-          StorageView cl_cpu(DataType::INT32);
-          cl_cpu.copy_from(cache_lengths.to(Device::CPU));
-          for (size_t s = 0; s < _max_slots; ++s) {
-            if (slots[s].active) {
-              for (dim_t b = 0; b < _beam_size; ++b)
-                cl_cpu.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = slots[s].step;
-            }
-          }
-          cache_lengths = cl_cpu.to(cache_lengths.device());
         }
       }
+
     }
 
     // Synchronize the CUDA stream before returning. This ensures all async

@@ -142,6 +142,26 @@ namespace fastertransformer {
 
 #define NOT_FOUND -1
 
+  // Device-compatible lowest value.  std::numeric_limits<__half>::lowest()
+  // is not specialized on device and returns 0, which breaks TopK for any
+  // input with negative values (e.g. log-softmax outputs).
+  template <typename T>
+  __device__ __forceinline__ T lowest_val() {
+    return std::numeric_limits<T>::lowest();
+  }
+
+  template<>
+  __device__ __forceinline__ __half lowest_val<__half>() {
+    return __float2half(-65504.0f);
+  }
+
+#if defined(__CUDA_BF16_TYPES_EXIST__)
+  template<>
+  __device__ __forceinline__ __nv_bfloat16 lowest_val<__nv_bfloat16>() {
+    return __float2bfloat16(-3.389e+38f);
+  }
+#endif
+
   template <typename T>
   __device__ __forceinline__ bool greater(const T& a, const T& b) {
     return a > b;
@@ -157,7 +177,7 @@ namespace fastertransformer {
   template <typename T>
   struct TopK {
     int p = NOT_FOUND;
-    T u = std::numeric_limits<T>::lowest();
+    T u = lowest_val<T>();
 
     __device__ __forceinline__ void insert(T elem, int elem_id) {
       if (greater(elem, u)) {
@@ -167,7 +187,7 @@ namespace fastertransformer {
     }
 
     __device__ __forceinline__ void init() {
-      u = std::numeric_limits<T>::lowest();
+      u = lowest_val<T>();
       p = NOT_FOUND;
     }
   };
@@ -213,7 +233,7 @@ namespace fastertransformer {
         topk_tmp_val_buf[index] = total.u;
         // If we found a max, blank out the value in the log prob array before starting the next iteration
         if (total.p != NOT_FOUND)
-          log_probs[total.p] = std::numeric_limits<T>::lowest();
+          log_probs[total.p] = lowest_val<T>();
       }
       __syncthreads();
     }
@@ -259,7 +279,7 @@ namespace fastertransformer {
 
       if (tid == 0) {
         topks[ite] = total;
-        s_val[total.p] = std::numeric_limits<T>::lowest();
+        s_val[total.p] = lowest_val<T>();
       }
       __syncthreads();
     }
