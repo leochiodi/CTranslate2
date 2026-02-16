@@ -88,6 +88,16 @@ namespace ctranslate2 {
       const dim_t _cache_time_dim;
       std::unique_ptr<const LayerNorm> _q_norm;  // Query normalization
       std::unique_ptr<const LayerNorm> _k_norm;  // Key normalization
+
+      // Per-row cache write positions for continuous batching scatter writes.
+      // When set, new K/V are written at cache[b, :, positions[b], :] instead of
+      // being appended via concat. This allows mid-decode slot insertion.
+      mutable const StorageView* _cache_write_positions = nullptr;
+
+    public:
+      void set_cache_write_positions(const StorageView* positions) const override {
+        _cache_write_positions = positions;
+      }
     };
   }
 }

@@ -982,6 +982,11 @@ namespace ctranslate2 {
 
       StorageView position_bias(dtype, device);
 
+      // Read cache_write_positions for scatter-based cache updates (mid-decode slot insertion).
+      const auto wp_it = state.find("cache_write_positions");
+      const StorageView* write_pos = (wp_it != state.end() && wp_it->second)
+                                     ? &wp_it->second : nullptr;
+
       // No sliding window chunking — Whisper doesn't use it.
       for (size_t l = 0; l < _layers.size(); ++l) {
         StorageView* cached_self_attn_keys = nullptr;
@@ -998,10 +1003,13 @@ namespace ctranslate2 {
           cached_attn_values = &state.at("memory_values_" + l_str);
         }
 
+        // Set scatter write positions on self-attention (only for self-attention caches).
+        _layers[l]->get_self_attention().set_cache_write_positions(write_pos);
+
         std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
         std::unique_ptr<StorageView> layer_attention;
         if (attention && heads_to_select)
-          layer_attention = std::make_unique<StorageView>(dtype, device);
+          layer_attention = std::make_unique<StorageView>(device);
 
         // offset=0 for per-element (position already encoded via per-element offsets).
         (*_layers[l])(layer_in,
@@ -1021,8 +1029,12 @@ namespace ctranslate2 {
                       /*offset=*/0);
         layer_in = std::move(layer_out);
 
+        // Clear scatter positions after each layer call.
+        _layers[l]->get_self_attention().set_cache_write_positions(nullptr);
+
         if (layer_attention) {
-          alignment_heads.emplace_back(dtype, device);
+          // Use layer_attention's actual dtype (may differ from output_type() in mixed precision).
+          alignment_heads.emplace_back(layer_attention->dtype(), device);
           ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
         }
       }
@@ -1033,6 +1045,15 @@ namespace ctranslate2 {
       }
 
       if (attention && !alignment_heads.empty()) {
+        // Ensure attention output has the correct dtype/device from the alignment heads.
+        // In mixed precision (e.g. compute_type='float16'), attention weights are float16
+        // but the caller may have created *attention with default dtype (float32).
+        // Concat/Mean dispatch on output dtype, so we must match the input dtype.
+        const auto heads_dtype = alignment_heads.front().dtype();
+        const auto heads_device = alignment_heads.front().device();
+        if (attention->dtype() != heads_dtype || attention->device() != heads_device)
+          *attention = StorageView(heads_dtype, heads_device);
+
         if (_average_alignment_heads) {
           ops::Mean(1)(alignment_heads[0], *attention);
           if (!is_sequence)

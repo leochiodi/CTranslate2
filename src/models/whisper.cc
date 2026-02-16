@@ -832,6 +832,41 @@ namespace ctranslate2 {
                              median_filter_width);
     }
 
+    WhisperAlignmentResult
+    WhisperContinuousBatcher::align_from_attention(
+        StorageView attention_weights,
+        const std::vector<size_t>& text_tokens,
+        size_t num_frames,
+        dim_t sot_sequence_length,
+        dim_t median_filter_width) {
+
+      // attention_weights: [num_alignment_heads, gen_steps, enc_time] (3D, on any device).
+      // We reshape to [1, heads, gen_steps, enc_time] for batch processing,
+      // trim enc_time to num_frames/2, apply softmax, and run the DTW pipeline.
+
+      num_frames /= 2;  // Encoder stride of 2.
+
+      attention_weights.expand_dims(0);  // [1, heads, gen_steps, enc_time]
+
+      // Trim encoder time to actual frames.
+      if (attention_weights.dim(3) > static_cast<dim_t>(num_frames))
+        remove_padding(attention_weights, 3, num_frames);
+
+      ops::SoftMax()(attention_weights);
+
+      // Use compute_alignments with a dummy start_sequence of the given length.
+      std::vector<size_t> dummy_start(sot_sequence_length, 0);
+      auto alignments = compute_alignments(attention_weights,
+                                           dummy_start,
+                                           {text_tokens},
+                                           median_filter_width);
+
+      WhisperAlignmentResult result;
+      result.alignments = std::move(alignments[0]);
+      // Note: text_token_probs are not available from pre-captured attention.
+      return result;
+    }
+
     bool WhisperContinuousBatcher::is_multilingual() const {
       return _replica->is_multilingual();
     }
@@ -926,6 +961,14 @@ namespace ctranslate2 {
             max_initial_timestamp_id));
       }
 
+      // Set alignment heads for cross-attention capture during decode.
+      bool capture_attention = false;
+      const auto ah = _model->config.find("alignment_heads");
+      if (ah != _model->config.end()) {
+        _decoder->set_alignment_heads(ah->get<std::vector<std::pair<dim_t, dim_t>>>());
+        capture_attention = true;
+      }
+
       ContinuousDecodingEngine engine(
         *_decoder,
         _max_slots,
@@ -937,7 +980,8 @@ namespace ctranslate2 {
         _options.max_length,
         *sampler,
         std::move(slot_init),
-        std::move(logits_processors));
+        std::move(logits_processors),
+        capture_attention);
 
       // Helper: convert internal Request to ContinuousRequest.
       auto convert_request = [this](Request& req) -> ContinuousRequest {
@@ -997,8 +1041,8 @@ namespace ctranslate2 {
           }
         }
 
-        // Process the batch (no queue_provider — mid-decode slot filling is disabled).
-        auto results = engine.process(local_queue, nullptr);
+        // Process the batch. queue_provider allows mid-decode slot filling.
+        auto results = engine.process(local_queue, queue_provider);
 
         // Convert and store results.
         {
@@ -1008,11 +1052,17 @@ namespace ctranslate2 {
             wr.sequences = vocabulary.to_tokens(cr.result.hypotheses);
             wr.sequences_ids = std::move(cr.result.hypotheses);
             wr.scores = std::move(cr.result.scores);
+            if (cr.attention_weights)
+              wr.attention_weights = std::move(cr.attention_weights);
             _results[cr.request_id] = std::move(wr);
           }
         }
         _results_cv.notify_all();
       }
+
+      // Synchronize CUDA stream before local objects (engine, tensors) are destroyed,
+      // to ensure all async operations (scatter writes, kernels) have completed.
+      synchronize_stream(_model->device());
     }
 
 

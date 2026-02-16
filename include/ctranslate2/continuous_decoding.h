@@ -26,6 +26,7 @@ namespace ctranslate2 {
   struct ContinuousResult {
     size_t request_id;
     DecodingResult result;
+    StorageView attention_weights;  // [num_alignment_heads, gen_steps, enc_time] (optional)
   };
 
   // State of a single slot in the continuous batch.
@@ -56,6 +57,10 @@ namespace ctranslate2 {
 
     // Helper: generation step (0-based, relative to start of generation).
     dim_t gen_step() const { return step - prompt_length; }
+
+    // Index into accumulated_attention's time dimension where this slot's
+    // attention starts (used when slots are recycled mid-decode).
+    dim_t attention_step_offset = 0;
   };
 
   // Base class for logits processors in continuous batching mode.
@@ -161,7 +166,8 @@ namespace ctranslate2 {
         dim_t max_length,
         const Sampler& sampler,
         SlotInitializer slot_initializer,
-        std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors = {});
+        std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors = {},
+        bool capture_attention = false);
 
     // Process requests from the queue. Returns results for completed requests.
     // queue_provider: optional callback to pull additional requests mid-decode
@@ -182,6 +188,7 @@ namespace ctranslate2 {
     const Sampler& _sampler;
     SlotInitializer _slot_initializer;
     std::vector<std::shared_ptr<ContinuousLogitsProcessor>> _logits_processors;
+    const bool _capture_attention;
 
     // Fill a free slot with a new request. Returns true if a request was available.
     bool fill_slot(size_t slot_idx,

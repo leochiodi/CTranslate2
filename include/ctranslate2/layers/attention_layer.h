@@ -41,6 +41,10 @@ namespace ctranslate2 {
 
       virtual bool has_positional_embeddings() const = 0;
 
+      // Set per-row write positions for scatter-based cache updates (continuous batching).
+      // Default is no-op; MultiHeadAttention overrides this.
+      virtual void set_cache_write_positions(const StorageView* /*positions*/) const {}
+
       bool multi_query() const {
         return _multi_query;
       }

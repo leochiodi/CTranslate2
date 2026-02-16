@@ -5,13 +5,89 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 
 #include "dispatch.h"
 #include "cpu/parallel.h"
 
+#ifdef CT2_WITH_CUDA
+#include "cuda/batch_copy.h"
+#endif
+
 namespace ctranslate2 {
   namespace layers {
+
+    // Scatter-write a single decode step into the K/V cache at per-row positions.
+    // cache:   [batch, heads, time, d]  (time_dim=2)  or  [batch, time, d]  (time_dim=1)
+    // step:    [batch, heads, 1, d]                   or  [batch, 1, d]
+    // positions: [batch] INT32 — write position for each batch row.
+    static void scatter_cache_step(StorageView& cache,
+                                   const StorageView& step,
+                                   const StorageView& positions,
+                                   dim_t time_dim) {
+      const Device device = cache.device();
+      const dim_t batch = cache.dim(0);
+      const dim_t heads = (time_dim == 2) ? cache.dim(1) : 1;
+      const dim_t cache_time = cache.dim(time_dim);
+      const dim_t d = cache.dim(time_dim + 1);
+
+      StorageView pos_cpu(DataType::INT32);
+      if (positions.device() != Device::CPU)
+        pos_cpu.copy_from(positions.to(Device::CPU));
+      else
+        pos_cpu.shallow_copy(const_cast<StorageView&>(positions));
+
+#ifdef CT2_WITH_CUDA
+      if (device == Device::CUDA) {
+        std::vector<cuda::CopyDescriptor> copies;
+        copies.reserve(batch * heads);
+        const dim_t elem_bytes = cache.item_size();
+
+        for (dim_t b = 0; b < batch; ++b) {
+          const dim_t pos = pos_cpu.at<int32_t>(b);
+          for (dim_t h = 0; h < heads; ++h) {
+            dim_t src_off, dst_off;
+            if (time_dim == 2) {
+              src_off = (b * heads + h) * 1 * d;
+              dst_off = (b * heads + h) * cache_time * d + pos * d;
+            } else {
+              src_off = b * 1 * d;
+              dst_off = b * cache_time * d + pos * d;
+            }
+            const char* src = reinterpret_cast<const char*>(step.buffer())
+                              + src_off * elem_bytes;
+            char* dst = reinterpret_cast<char*>(cache.buffer())
+                        + dst_off * elem_bytes;
+            copies.push_back({src, dst, static_cast<size_t>(d * elem_bytes)});
+          }
+        }
+
+        cuda::batch_copy_async(copies);
+        return;
+      }
+#endif
+
+      // CPU path: use raw memcpy since we only target CPU here.
+      const dim_t elem_bytes = cache.item_size();
+      for (dim_t b = 0; b < batch; ++b) {
+        const dim_t pos = pos_cpu.at<int32_t>(b);
+        for (dim_t h = 0; h < heads; ++h) {
+          dim_t src_off;
+          dim_t dst_off;
+          if (time_dim == 2) {
+            src_off = (b * heads + h) * 1 * d;
+            dst_off = (b * heads + h) * cache_time * d + pos * d;
+          } else {
+            src_off = b * 1 * d;
+            dst_off = b * cache_time * d + pos * d;
+          }
+          std::memcpy(reinterpret_cast<char*>(cache.buffer()) + dst_off * elem_bytes,
+                      reinterpret_cast<const char*>(step.buffer()) + src_off * elem_bytes,
+                      d * elem_bytes);
+        }
+      }
+    }
 
     StorageView make_relative_positions(dim_t queries_length,
                                         dim_t keys_length,
@@ -170,6 +246,9 @@ namespace ctranslate2 {
       if (beam_size == 1)
         attention = std::move(weights);
       else {
+        // Ensure output dtype matches input (may differ in mixed precision).
+        if (attention.dtype() != weights.dtype())
+          attention = StorageView(weights.dtype(), weights.device());
         transpose_op(weights, attention);
         attention.reshape({-1, weights.dim(1), 1, weights.dim(-1)});
       }
@@ -506,6 +585,12 @@ namespace ctranslate2 {
           if (cached_keys->empty()) {
             *cached_keys = std::move(keys_proj);
             *cached_values = std::move(values_proj);
+          } else if (_cache_write_positions) {
+            // Scatter path: write each batch row's K/V at its designated position.
+            scatter_cache_step(*cached_keys, keys_proj,
+                               *_cache_write_positions, _cache_time_dim);
+            scatter_cache_step(*cached_values, values_proj,
+                               *_cache_write_positions, _cache_time_dim);
           } else {
             const ops::Concat concat_op(_cache_time_dim);
             StorageView& tmp = fused_proj;  // Reuse storage.

@@ -212,6 +212,19 @@ namespace ctranslate2 {
                                median_filter_width);
       }
 
+      models::WhisperAlignmentResult
+      align_from_attention(const StorageView& attention_weights,
+                           Ids text_tokens,
+                           size_t num_frames,
+                           size_t sot_sequence_length,
+                           size_t median_filter_width) {
+        return _batcher->align_from_attention(attention_weights.sync_copy(),
+                                              std::move(text_tokens),
+                                              num_frames,
+                                              sot_sequence_length,
+                                              median_filter_width);
+      }
+
     private:
       std::unique_ptr<models::WhisperContinuousBatcher> _batcher;
     };
@@ -231,6 +244,10 @@ namespace ctranslate2 {
                       "logits in each sequence (empty if :obj:`return_logits_vocab` was disabled).")
         .def_readonly("no_speech_prob", &models::WhisperGenerationResult::no_speech_prob,
                       "Probability of the no speech token (0 if :obj:`return_no_speech_prob` was disabled).")
+        .def_readonly("attention_weights", &models::WhisperGenerationResult::attention_weights,
+                      "Cross-attention weights captured during decode "
+                      "(shape: ``[num_alignment_heads, gen_steps, enc_time]``). "
+                      "Empty if attention capture was not enabled.")
 
         .def("__repr__", [](const models::WhisperGenerationResult& result) {
           return "WhisperGenerationResult(sequences=" + std::string(py::repr(py::cast(result.sequences)))
@@ -633,6 +650,34 @@ namespace ctranslate2 {
 
                  Returns:
                    A list of alignment results.
+             )pbdoc")
+
+        .def("align_from_attention", &WhisperContinuousBatcherWrapper::align_from_attention,
+             py::arg("attention_weights"), py::arg("text_tokens"),
+             py::arg("num_frames"),
+             py::kw_only(),
+             py::arg("sot_sequence_length")=0,
+             py::arg("median_filter_width")=7,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Computes alignments from pre-captured attention weights (no decoder pass needed).
+
+                 This uses the cross-attention weights captured during continuous batching
+                 decode to compute word-level alignments, eliminating the separate align() call.
+
+                 Arguments:
+                   attention_weights: Cross-attention weights from
+                     ``WhisperGenerationResult.attention_weights`` with shape
+                     ``[num_alignment_heads, gen_steps, enc_time]``.
+                   text_tokens: The text token IDs to align (excluding SOT sequence and EOT).
+                   num_frames: Number of non-padding audio frames.
+                   sot_sequence_length: Number of prefix positions to skip in the attention
+                     (default 0, which is correct when the attention starts from the first
+                     generated position).
+                   median_filter_width: Width of the median filter kernel.
+
+                 Returns:
+                   A WhisperAlignmentResult.
              )pbdoc")
         ;
     }

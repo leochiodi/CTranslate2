@@ -73,6 +73,7 @@ namespace ctranslate2 {
       std::vector<float> scores;
       std::vector<std::vector<StorageView>> logits;
       float no_speech_prob = 0;
+      StorageView attention_weights;  // [num_alignment_heads, gen_steps, enc_time] (optional)
 
       size_t num_sequences() const {
         return sequences.size();
@@ -256,6 +257,18 @@ namespace ctranslate2 {
             const std::vector<std::vector<size_t>>& text_tokens,
             std::vector<size_t> num_frames,
             dim_t median_filter_width = 7);
+
+      // Compute alignments from pre-captured attention weights (no decoder pass needed).
+      // attention_weights: [num_alignment_heads, gen_steps, enc_time] from a single request.
+      // text_tokens: the text tokens for this request (excluding start sequence and EOT).
+      // num_frames: number of audio frames for this request.
+      // sot_sequence_length: length of the start-of-transcript sequence (sot + lang + task + notimestamps).
+      WhisperAlignmentResult
+      align_from_attention(StorageView attention_weights,
+                           const std::vector<size_t>& text_tokens,
+                           size_t num_frames,
+                           dim_t sot_sequence_length,
+                           dim_t median_filter_width = 7);
 
       bool is_multilingual() const;
 
