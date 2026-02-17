@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 
 #include "ctranslate2/devices.h"
@@ -629,6 +630,14 @@ namespace ctranslate2 {
     StorageView best_ids(DataType::INT32);
     StorageView best_probs(dtype);
 
+    // Pre-allocated attention accumulation buffer tracking.
+    dim_t attention_capacity = 0;
+    dim_t attention_time = 0;
+
+    // Reusable scratch buffers (avoid per-step allocation).
+    StorageView step_offsets({total_batch}, DataType::INT32);
+    StorageView gather_indices_scratch({total_batch}, DataType::INT32);
+
     // Main decode loop.
     while (true) {
       // Recompute active count from slot states each iteration.
@@ -645,7 +654,6 @@ namespace ctranslate2 {
         break;
 
       // Build step_offsets for ALL batch rows (on CPU).
-      StorageView step_offsets({total_batch}, DataType::INT32);
       for (size_t s = 0; s < _max_slots; ++s) {
         const int32_t step_val = slots[s].active ? slots[s].step : 0;
         for (dim_t b = 0; b < _beam_size; ++b)
@@ -655,8 +663,10 @@ namespace ctranslate2 {
       // Store CPU step_offsets in batch_state so transformer.cc can skip GPU→CPU copy.
       batch_state["step_offsets_cpu"] = step_offsets;
 
+      // Create GPU copy for the decode step (keep CPU scratch buffer intact).
+      StorageView step_offsets_device(step_offsets);
       if (device != Device::CPU)
-        step_offsets = step_offsets.to(device);
+        step_offsets_device = step_offsets_device.to(device);
 
       // Expand self-attention caches if any row's write position would exceed cache time.
       // Also set cache_write_positions for scatter-based writes.
@@ -692,27 +702,103 @@ namespace ctranslate2 {
 
       // Run one decode step.
       StorageView step_attention(device);
-      _decoder(step_offsets, sample_from.to(device), batch_state, &logits,
+      _decoder(step_offsets_device, sample_from.to(device), batch_state, &logits,
                _capture_attention ? &step_attention : nullptr);
 
       // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");
       batch_state.erase("step_offsets_cpu");
 
-      // Accumulate cross-attention weights per step.
-      // step_attention: [total_batch, num_alignment_heads, enc_time] (3D, after squeeze in decoder).
-      // We unsqueeze to 4D and concat along dim 2 (time) to build
-      // [total_batch, num_alignment_heads, gen_steps, enc_time].
+      // Accumulate cross-attention weights per step using pre-allocated buffer.
+      // step_attention: [total_batch, num_alignment_heads, enc_time] (3D).
+      // We write each step directly into accum[:, :, attention_time, :] to avoid
+      // O(N^2) concat copies. Buffer grows geometrically when needed.
       if (_capture_attention && step_attention) {
         step_attention.expand_dims(2);  // [total_batch, heads, 1, enc_time]
         auto& accum = batch_state["accumulated_attention"];
-        if (!accum) {
-          accum = std::move(step_attention);
-        } else {
-          StorageView tmp = std::move(accum);
-          const ops::Concat concat_time(2);
-          concat_time({&tmp, &step_attention}, accum);
+
+        const dim_t n_batch = step_attention.dim(0);
+        const dim_t n_heads = step_attention.dim(1);
+        const dim_t enc_time = step_attention.dim(3);
+        const dim_t elem_bytes = step_attention.item_size();
+        const dim_t row_bytes = enc_time * elem_bytes;
+
+        // Grow buffer if needed (geometric doubling).
+        if (attention_time >= attention_capacity) {
+          const dim_t old_cap = attention_capacity;
+          const dim_t new_cap = (old_cap == 0) ? 64 : old_cap * 2;
+
+          StorageView new_accum({n_batch, n_heads, new_cap, enc_time},
+                                step_attention.dtype(), device);
+
+          // Copy old data with strided copy (time dim is not last).
+          if (attention_time > 0 && accum) {
+            const char* old_data = static_cast<const char*>(accum.buffer());
+            char* new_data = static_cast<char*>(new_accum.buffer());
+            const dim_t copy_bytes = attention_time * row_bytes;
+
+            if (device == Device::CPU) {
+              for (dim_t b = 0; b < n_batch; ++b) {
+                for (dim_t h = 0; h < n_heads; ++h) {
+                  const dim_t bh = b * n_heads + h;
+                  std::memcpy(new_data + bh * new_cap * row_bytes,
+                              old_data + bh * old_cap * row_bytes,
+                              copy_bytes);
+                }
+              }
+            } else {
+#ifdef CT2_WITH_CUDA
+              std::vector<cuda::CopyDescriptor> copies;
+              copies.reserve(n_batch * n_heads);
+              for (dim_t b = 0; b < n_batch; ++b) {
+                for (dim_t h = 0; h < n_heads; ++h) {
+                  const dim_t bh = b * n_heads + h;
+                  copies.push_back({old_data + bh * old_cap * row_bytes,
+                                    new_data + bh * new_cap * row_bytes,
+                                    static_cast<size_t>(copy_bytes)});
+                }
+              }
+              cuda::batch_copy_async(copies);
+#endif
+            }
+          }
+
+          accum = std::move(new_accum);
+          attention_capacity = new_cap;
         }
+
+        // Write step_attention[:, :, 0, :] into accum[:, :, attention_time, :].
+        {
+          const char* src = static_cast<const char*>(step_attention.buffer());
+          char* dst = static_cast<char*>(accum.buffer());
+
+          if (device == Device::CPU) {
+            for (dim_t b = 0; b < n_batch; ++b) {
+              for (dim_t h = 0; h < n_heads; ++h) {
+                const dim_t bh = b * n_heads + h;
+                std::memcpy(dst + (bh * attention_capacity + attention_time) * row_bytes,
+                            src + bh * row_bytes,
+                            row_bytes);
+              }
+            }
+          } else {
+#ifdef CT2_WITH_CUDA
+            std::vector<cuda::CopyDescriptor> copies;
+            copies.reserve(n_batch * n_heads);
+            for (dim_t b = 0; b < n_batch; ++b) {
+              for (dim_t h = 0; h < n_heads; ++h) {
+                const dim_t bh = b * n_heads + h;
+                copies.push_back({src + bh * row_bytes,
+                                  dst + (bh * attention_capacity + attention_time) * row_bytes,
+                                  static_cast<size_t>(row_bytes)});
+              }
+            }
+            cuda::batch_copy_async(copies);
+#endif
+          }
+        }
+
+        attention_time++;
       }
 
       // Apply logits processors.
@@ -746,16 +832,16 @@ namespace ctranslate2 {
             if (_capture_attention) {
               const auto& accum = batch_state["accumulated_attention"];
               if (accum) {
-                // Match output dtype/device to accumulated attention (may be float16).
                 cr.attention_weights = StorageView(accum.dtype(), accum.device());
                 StorageView slot_idx({1}, int32_t(s), device);
                 ops::Gather()(accum, slot_idx, cr.attention_weights);
-                cr.attention_weights.squeeze(0);  // [heads, total_time, enc_time]
+                cr.attention_weights.squeeze(0);  // [heads, capacity, enc_time]
 
-                // If this slot was recycled mid-decode, slice out only its portion.
+                // Slice [offset, attention_time) to trim both the pre-alloc
+                // capacity padding and any prior slot's data.
                 const dim_t offset = slots[s].attention_step_offset;
-                if (offset > 0 && cr.attention_weights.dim(1) > offset) {
-                  const dim_t slot_time = cr.attention_weights.dim(1) - offset;
+                const dim_t slot_time = attention_time - offset;
+                if (slot_time > 0 && slot_time < cr.attention_weights.dim(1)) {
                   StorageView sliced(cr.attention_weights.dtype(),
                                      cr.attention_weights.device());
                   const ops::Slide slice_op(1, offset, slot_time);
@@ -777,11 +863,9 @@ namespace ctranslate2 {
         // cache_lengths position (not appended at the end).
         for (const size_t s : finished_slots) {
           // Record the attention offset for the new slot occupant.
-          const auto& accum = batch_state["accumulated_attention"];
-          const dim_t attn_time = (accum && accum.rank() >= 3) ? accum.dim(2) : 0;
           fill_slot(s, request_queue, queue_provider, slots, batch_state);
           if (slots[s].active)
-            slots[s].attention_step_offset = attn_time;
+            slots[s].attention_step_offset = attention_time;
         }
 
       } else {
@@ -804,7 +888,8 @@ namespace ctranslate2 {
         topk_values = topk_values.to(Device::CPU);
         topk_indices = topk_indices.to(Device::CPU);
 
-        StorageView gather_indices({total_batch}, DataType::INT32);
+        // Reuse scratch buffer for gather indices.
+        StorageView& gather_indices = gather_indices_scratch;
 
         // Initialize gather_indices to identity (inactive slots keep their rows).
         for (dim_t i = 0; i < total_batch; ++i)
@@ -933,12 +1018,13 @@ namespace ctranslate2 {
                 cr.attention_weights = StorageView(accum.dtype(), accum.device());
                 StorageView slot_idx({1}, int32_t(s_offset), device);
                 ops::Gather()(accum, slot_idx, cr.attention_weights);
-                cr.attention_weights.squeeze(0);  // [heads, total_time, enc_time]
+                cr.attention_weights.squeeze(0);  // [heads, capacity, enc_time]
 
-                // If this slot was recycled mid-decode, slice out only its portion.
+                // Slice [offset, attention_time) to trim both the pre-alloc
+                // capacity padding and any prior slot's data.
                 const dim_t offset = slot.attention_step_offset;
-                if (offset > 0 && cr.attention_weights.dim(1) > offset) {
-                  const dim_t slot_time = cr.attention_weights.dim(1) - offset;
+                const dim_t slot_time = attention_time - offset;
+                if (slot_time > 0 && slot_time < cr.attention_weights.dim(1)) {
                   StorageView sliced(cr.attention_weights.dtype(),
                                      cr.attention_weights.device());
                   const ops::Slide slice_op(1, offset, slot_time);
@@ -985,26 +1071,31 @@ namespace ctranslate2 {
           }
         }
 
-        // Apply beam reordering to all state tensors.
-        if (device != Device::CPU)
-          gather_indices = gather_indices.to(device);
+        // Apply beam reordering to all state tensors (skip if identity permutation).
+        bool is_identity = true;
+        for (dim_t i = 0; i < total_batch && is_identity; ++i)
+          is_identity = (gather_indices.at<int32_t>(i) == i);
 
-        for (auto& [name, value] : batch_state) {
-          if (name.find("_retain_memory") != std::string::npos)
-            continue;
-          if (name == "cache_lengths")
-            continue;
-          if (value && value.dim(0) == total_batch)
-            ops::Gather()(value, gather_indices);
+        if (!is_identity) {
+          StorageView gather_device(gather_indices);
+          if (device != Device::CPU)
+            gather_device = gather_device.to(device);
+
+          for (auto& [name, value] : batch_state) {
+            if (name.find("_retain_memory") != std::string::npos)
+              continue;
+            if (name == "cache_lengths")
+              continue;
+            if (value && value.dim(0) == total_batch)
+              ops::Gather()(value, gather_device);
+          }
         }
 
         // Mid-decode slot filling for beam search path.
         for (const size_t s : finished_slots) {
-          const auto& accum = batch_state["accumulated_attention"];
-          const dim_t attn_time = (accum && accum.rank() >= 3) ? accum.dim(2) : 0;
           fill_slot(s, request_queue, queue_provider, slots, batch_state);
           if (slots[s].active)
-            slots[s].attention_step_offset = attn_time;
+            slots[s].attention_step_offset = attention_time;
         }
       }
 
@@ -1014,11 +1105,9 @@ namespace ctranslate2 {
       // causing requests to serialize instead of batching.
       for (size_t s = 0; s < _max_slots; ++s) {
         if (!slots[s].active) {
-          const auto& accum = batch_state["accumulated_attention"];
-          const dim_t attn_time = (accum && accum.rank() >= 3) ? accum.dim(2) : 0;
           if (!fill_slot(s, request_queue, queue_provider, slots, batch_state))
             break;  // No more requests available.
-          slots[s].attention_step_offset = attn_time;
+          slots[s].attention_step_offset = attention_time;
         }
       }
 
@@ -1045,12 +1134,21 @@ namespace ctranslate2 {
           }
         }
       } else {
-        // For beam path, sample_from was already updated per-slot above.
-        // Just ensure inactive slots have dummy values.
+        // For beam path, sample_from was updated per-slot during beam selection
+        // above, but newly filled slots (from fill_slot) still have stale tokens.
+        // Rebuild for all slots to ensure correctness.
         for (size_t s = 0; s < _max_slots; ++s) {
-          if (!slots[s].active) {
+          const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
+          if (slots[s].active) {
+            if (slots[s].generated_tokens.empty()) {
+              // New slot (just filled) — use start_id for beam 0, 0 for other beams.
+              for (dim_t b = 0; b < _beam_size; ++b)
+                sample_from.at<int32_t>(s_offset + b) = (b == 0) ? slots[s].start_id : 0;
+            }
+            // Otherwise, beam selection already set the correct tokens above.
+          } else {
             for (dim_t b = 0; b < _beam_size; ++b)
-              sample_from.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = 0;
+              sample_from.at<int32_t>(s_offset + b) = 0;
           }
         }
       }

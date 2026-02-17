@@ -191,6 +191,17 @@ namespace ctranslate2 {
       else
         offsets_cpu.shallow_copy(const_cast<StorageView&>(offsets));
 
+      // Fast path: all offsets identical → use scalar broadcast (same as standard path).
+      const int32_t first = offsets_cpu.at<int32_t>(0);
+      bool uniform = true;
+      for (dim_t i = 1; i < batch_size; ++i) {
+        if (offsets_cpu.at<int32_t>(i) != first) { uniform = false; break; }
+      }
+      if (uniform) {
+        operator()(input, dim_t(first));
+        return;
+      }
+
       dim_t max_offset = 0;
       for (dim_t i = 0; i < batch_size; ++i)
         max_offset = std::max(max_offset, dim_t(offsets_cpu.at<int32_t>(i)));

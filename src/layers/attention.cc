@@ -13,6 +13,7 @@
 
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
+#include "cuda/utils.h"
 #endif
 
 namespace ctranslate2 {
@@ -31,6 +32,7 @@ namespace ctranslate2 {
       const dim_t heads = (time_dim == 2) ? cache.dim(1) : 1;
       const dim_t cache_time = cache.dim(time_dim);
       const dim_t d = cache.dim(time_dim + 1);
+      const dim_t elem_bytes = cache.item_size();
 
       StorageView pos_cpu(DataType::INT32);
       if (positions.device() != Device::CPU)
@@ -38,11 +40,34 @@ namespace ctranslate2 {
       else
         pos_cpu.shallow_copy(const_cast<StorageView&>(positions));
 
+      // Fast path: all positions identical → single strided copy.
+      const int32_t pos0 = pos_cpu.at<int32_t>(0);
+      bool uniform = true;
+      for (dim_t b = 1; b < batch; ++b) {
+        if (pos_cpu.at<int32_t>(b) != pos0) { uniform = false; break; }
+      }
+
 #ifdef CT2_WITH_CUDA
       if (device == Device::CUDA) {
+        if (uniform) {
+          // All rows write to the same time position → use cudaMemcpy2DAsync.
+          // Source: step[batch*heads, 1, d] contiguous, pitch = d * elem_bytes.
+          // Dest: cache[batch*heads, cache_time, d] at time pos0, pitch = cache_time * d * elem_bytes.
+          const size_t row_bytes = static_cast<size_t>(d * elem_bytes);
+          CUDA_CHECK(cudaMemcpy2DAsync(
+              reinterpret_cast<char*>(cache.buffer()) + pos0 * d * elem_bytes,
+              cache_time * row_bytes,                           // dst pitch
+              reinterpret_cast<const char*>(step.buffer()),
+              row_bytes,                                        // src pitch
+              row_bytes,                                        // width
+              static_cast<size_t>(batch * heads),               // height
+              cudaMemcpyDeviceToDevice,
+              cuda::get_cuda_stream()));
+          return;
+        }
+
         std::vector<cuda::CopyDescriptor> copies;
         copies.reserve(batch * heads);
-        const dim_t elem_bytes = cache.item_size();
 
         for (dim_t b = 0; b < batch; ++b) {
           const dim_t pos = pos_cpu.at<int32_t>(b);
@@ -68,8 +93,19 @@ namespace ctranslate2 {
       }
 #endif
 
-      // CPU path: use raw memcpy since we only target CPU here.
-      const dim_t elem_bytes = cache.item_size();
+      // CPU path.
+      if (uniform) {
+        const size_t row_bytes = d * elem_bytes;
+        for (dim_t bh = 0; bh < batch * heads; ++bh) {
+          std::memcpy(reinterpret_cast<char*>(cache.buffer())
+                        + (bh * cache_time + pos0) * d * elem_bytes,
+                      reinterpret_cast<const char*>(step.buffer())
+                        + bh * row_bytes,
+                      row_bytes);
+        }
+        return;
+      }
+
       for (dim_t b = 0; b < batch; ++b) {
         const dim_t pos = pos_cpu.at<int32_t>(b);
         for (dim_t h = 0; h < heads; ++h) {

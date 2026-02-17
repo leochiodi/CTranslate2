@@ -894,8 +894,9 @@ namespace ctranslate2 {
         layer_in.expand_dims(1);
 
       // Per-element position encoding.
+      // Pass CPU offsets to avoid GPU→CPU sync inside the position encoder.
       if (_position_encoder)
-        (*_position_encoder)(layer_in, step_offsets);
+        (*_position_encoder)(layer_in, static_cast<const StorageView&>(offsets_cpu));
 
       if (_layernorm_embedding)
         (*_layernorm_embedding)(layer_in, layer_in);

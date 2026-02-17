@@ -891,10 +891,10 @@ namespace ctranslate2 {
           if (!_running && _raw_queue.empty())
             break;
 
-          // Brief batching window: wait up to 10ms to collect more requests
+          // Brief batching window: wait up to 2ms to collect more requests
           // so simultaneous arrivals can be batch-encoded in a single GPU call.
           if (_raw_queue.size() < _max_slots) {
-            _raw_queue_cv.wait_for(lock, std::chrono::milliseconds(10),
+            _raw_queue_cv.wait_for(lock, std::chrono::milliseconds(2),
               [&] { return !_running || _raw_queue.size() >= _max_slots; });
           }
 
@@ -1115,10 +1115,10 @@ namespace ctranslate2 {
           if (!_running && _encoded_queue.empty())
             break;
 
-          // Brief batching window: wait up to 50ms to collect more requests
+          // Brief batching window: wait up to 5ms to collect more requests
           // so that requests submitted in quick succession land in the same batch.
           if (_encoded_queue.size() < _max_slots) {
-            _encoded_queue_cv.wait_for(lock, std::chrono::milliseconds(50),
+            _encoded_queue_cv.wait_for(lock, std::chrono::milliseconds(5),
               [&] { return !_running || _encoded_queue.size() >= _max_slots; });
           }
 
