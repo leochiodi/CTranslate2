@@ -9,6 +9,16 @@
 #include "ctranslate2/ops/ops.h"
 #include "dispatch.h"
 
+// Debug logging for beam search — enable with CT2_BEAM_DEBUG=1
+static bool beam_debug_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* env = std::getenv("CT2_BEAM_DEBUG");
+    enabled = (env && std::string(env) == "1") ? 1 : 0;
+  }
+  return enabled == 1;
+}
+
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
 #endif
@@ -663,6 +673,27 @@ namespace ctranslate2 {
       // Store CPU step_offsets in batch_state so transformer.cc can skip GPU→CPU copy.
       batch_state["step_offsets_cpu"] = step_offsets;
 
+      // Debug: log inputs to decode step.
+      if (beam_debug_enabled() && _beam_size > 1) {
+        // Find gen_step from first active slot.
+        dim_t gs = -1;
+        for (const size_t s : active_slot_indices) { gs = slots[s].gen_step(); break; }
+        if (gs >= 0 && gs <= 5) {
+          fprintf(stderr, "[BEAM] === decode step, gen_step=%ld ===\n", (long)gs);
+          fprintf(stderr, "[BEAM]   step_offsets:");
+          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
+            fprintf(stderr, " %d", step_offsets.at<int32_t>(i));
+          fprintf(stderr, "\n[BEAM]   sample_from:");
+          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
+            fprintf(stderr, " %d", sample_from.at<int32_t>(i));
+          fprintf(stderr, "\n[BEAM]   cache_lengths:");
+          const auto& cl = batch_state["cache_lengths"];
+          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
+            fprintf(stderr, " %d", cl.at<int32_t>(i));
+          fprintf(stderr, "\n");
+        }
+      }
+
       // Create GPU copy for the decode step (keep CPU scratch buffer intact).
       StorageView step_offsets_device(step_offsets);
       if (device != Device::CPU)
@@ -1068,6 +1099,20 @@ namespace ctranslate2 {
           // Update sample_from for this slot's beams.
           for (dim_t b = 0; b < _beam_size; ++b) {
             sample_from.at<int32_t>(s_offset + b) = new_beam_token[b];
+          }
+
+          // Debug logging.
+          if (beam_debug_enabled() && slot.gen_step() <= 5) {
+            fprintf(stderr, "[BEAM] slot=%zu gen_step=%ld  beams:", s, (long)slot.gen_step());
+            for (dim_t b = 0; b < _beam_size; ++b)
+              fprintf(stderr, " [%ld->%ld tok=%zu sc=%.2f]",
+                      (long)b, (long)slot.beam_tokens[b].size(),
+                      slot.beam_tokens[b].empty() ? 0 : slot.beam_tokens[b].back(),
+                      slot.beam_scores[b]);
+            fprintf(stderr, "  gather:");
+            for (dim_t b = 0; b < _beam_size; ++b)
+              fprintf(stderr, " %d", gather_indices.at<int32_t>(s_offset + b));
+            fprintf(stderr, "\n");
           }
         }
 

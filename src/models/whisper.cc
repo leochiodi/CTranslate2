@@ -949,6 +949,9 @@ namespace ctranslate2 {
           }
         }
 
+        // Ensure GPU writes are visible to the worker thread's stream.
+        synchronize_stream(device);
+
         // Push encoded requests to the encoded queue.
         {
           std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
@@ -987,21 +990,15 @@ namespace ctranslate2 {
           state["memory"] = std::move(encoded);
         }
 
-        // Prevent forward_prompt from erasing "memory" (standard decode erases it
-        // at step 0 when _retain_memory is absent).  The continuous batching
-        // decoder needs memory to remain in the state so cross-attention layers
-        // can safely dereference the pointer even though cached projections are
-        // already filled.
+        // Keep memory across forward_prompt (standard decode erases it at step 0).
         state["_retain_memory"] = StorageView();
 
-        // Run forward_prompt with prompt tokens.
         if (!request.prompt_tokens.empty()) {
           StorageView input_ids = layers::make_sequence_inputs(
             {request.prompt_tokens}, device);
           _decoder->forward_prompt(input_ids, state);
         }
 
-        // Remove the marker — the continuous decode loop re-sets it each step.
         state.erase("_retain_memory");
       };
 
