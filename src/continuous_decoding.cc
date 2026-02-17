@@ -1008,6 +1008,20 @@ namespace ctranslate2 {
         }
       }
 
+      // Proactively fill any inactive slots with queued requests.
+      // Without this, only finished (recycled) slots get new work — empty slots
+      // that were never used in the initial fill sit idle for the entire decode,
+      // causing requests to serialize instead of batching.
+      for (size_t s = 0; s < _max_slots; ++s) {
+        if (!slots[s].active) {
+          const auto& accum = batch_state["accumulated_attention"];
+          const dim_t attn_time = (accum && accum.rank() >= 3) ? accum.dim(2) : 0;
+          if (!fill_slot(s, request_queue, queue_provider, slots, batch_state))
+            break;  // No more requests available.
+          slots[s].attention_step_offset = attn_time;
+        }
+      }
+
       // Recount active slots.
       active_count = 0;
       for (size_t s = 0; s < _max_slots; ++s) {

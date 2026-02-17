@@ -5,6 +5,7 @@
 
 #include "ctranslate2/continuous_decoding.h"
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/ops/ops.h"
 #include "ctranslate2/sampling.h"
 
 #include "dispatch.h"
@@ -771,10 +772,10 @@ namespace ctranslate2 {
                                             std::vector<size_t> prompt) {
       const size_t id = _next_id.fetch_add(1);
       {
-        std::lock_guard<std::mutex> lock(_queue_mutex);
-        _queue.push(Request{id, std::move(features), std::move(prompt)});
+        std::lock_guard<std::mutex> lock(_raw_queue_mutex);
+        _raw_queue.push(Request{id, std::move(features), std::move(prompt)});
       }
-      _queue_cv.notify_one();
+      _raw_queue_cv.notify_one();
       return id;
     }
 
@@ -796,13 +797,18 @@ namespace ctranslate2 {
     void WhisperContinuousBatcher::start() {
       if (_running.exchange(true))
         return;  // Already running.
+      _encoder_thread = std::thread(&WhisperContinuousBatcher::encoder_loop, this);
       _worker = std::thread(&WhisperContinuousBatcher::worker_loop, this);
     }
 
     void WhisperContinuousBatcher::stop() {
       if (!_running.exchange(false))
         return;  // Not running.
-      _queue_cv.notify_all();
+      // Wake both threads so they can exit.
+      _raw_queue_cv.notify_all();
+      _encoded_queue_cv.notify_all();
+      if (_encoder_thread.joinable())
+        _encoder_thread.join();
       if (_worker.joinable())
         _worker.join();
     }
@@ -869,6 +875,88 @@ namespace ctranslate2 {
 
     bool WhisperContinuousBatcher::is_multilingual() const {
       return _replica->is_multilingual();
+    }
+
+    void WhisperContinuousBatcher::encoder_loop() {
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _model->device();
+      const DataType dtype = _encoder->output_type();
+
+      while (_running) {
+        std::vector<Request> requests;
+
+        {
+          std::unique_lock<std::mutex> lock(_raw_queue_mutex);
+          _raw_queue_cv.wait(lock, [&] { return !_running || !_raw_queue.empty(); });
+          if (!_running && _raw_queue.empty())
+            break;
+
+          // Brief batching window: wait up to 10ms to collect more requests
+          // so simultaneous arrivals can be batch-encoded in a single GPU call.
+          if (_raw_queue.size() < _max_slots) {
+            _raw_queue_cv.wait_for(lock, std::chrono::milliseconds(10),
+              [&] { return !_running || _raw_queue.size() >= _max_slots; });
+          }
+
+          while (!_raw_queue.empty()) {
+            requests.push_back(std::move(_raw_queue.front()));
+            _raw_queue.pop();
+          }
+        }
+
+        if (requests.empty())
+          continue;
+
+        // Identify which requests need encoding.
+        std::vector<size_t> to_encode;
+        for (size_t i = 0; i < requests.size(); ++i) {
+          if (!_encoder->is_encoded(requests[i].features))
+            to_encode.push_back(i);
+        }
+
+        if (!to_encode.empty()) {
+          // Move features to device/dtype.
+          for (const size_t idx : to_encode)
+            requests[idx].features.move_to(device, dtype);
+
+          if (to_encode.size() == 1) {
+            // Single request: encode directly, no concat/split overhead.
+            StorageView encoded(dtype, device);
+            (*_encoder)(requests[to_encode[0]].features, encoded);
+            requests[to_encode[0]].features = std::move(encoded);
+          } else {
+            // Batch-encode: concat along batch dim, single encoder call, split back.
+            std::vector<const StorageView*> feature_ptrs;
+            feature_ptrs.reserve(to_encode.size());
+            for (const size_t idx : to_encode)
+              feature_ptrs.push_back(&requests[idx].features);
+
+            StorageView batch_features(dtype, device);
+            ops::Concat(0)(feature_ptrs, batch_features);
+
+            StorageView batch_encoded(dtype, device);
+            (*_encoder)(batch_features, batch_encoded);
+
+            // Split back into individual [1, T, D] results.
+            for (size_t i = 0; i < to_encode.size(); ++i) {
+              StorageView indices({1}, static_cast<int32_t>(i));
+              if (device != Device::CPU)
+                indices = indices.to(device);
+              StorageView single(dtype, device);
+              ops::Gather(0)(batch_encoded, indices, single);
+              requests[to_encode[i]].features = std::move(single);
+            }
+          }
+        }
+
+        // Push encoded requests to the encoded queue.
+        {
+          std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
+          for (auto& req : requests)
+            _encoded_queue.push(std::move(req));
+        }
+        _encoded_queue_cv.notify_all();
+      }
     }
 
     void WhisperContinuousBatcher::worker_loop() {
@@ -1007,36 +1095,37 @@ namespace ctranslate2 {
       };
 
       // QueueProvider: allows the engine to pull new requests mid-decode.
+      // Reads from _encoded_queue so features are already encoded.
       QueueProvider queue_provider = [this, &convert_request]()
           -> std::optional<ContinuousRequest> {
-        std::lock_guard<std::mutex> lock(_queue_mutex);
-        if (_queue.empty())
+        std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
+        if (_encoded_queue.empty())
           return std::nullopt;
-        Request req = std::move(_queue.front());
-        _queue.pop();
+        Request req = std::move(_encoded_queue.front());
+        _encoded_queue.pop();
         return convert_request(req);
       };
 
       while (_running) {
-        // Wait for work.
+        // Wait for encoded work from the encoder thread.
         std::queue<ContinuousRequest> local_queue;
         {
-          std::unique_lock<std::mutex> lock(_queue_mutex);
-          _queue_cv.wait(lock, [&] { return !_running || !_queue.empty(); });
-          if (!_running && _queue.empty())
+          std::unique_lock<std::mutex> lock(_encoded_queue_mutex);
+          _encoded_queue_cv.wait(lock, [&] { return !_running || !_encoded_queue.empty(); });
+          if (!_running && _encoded_queue.empty())
             break;
 
           // Brief batching window: wait up to 50ms to collect more requests
           // so that requests submitted in quick succession land in the same batch.
-          if (_queue.size() < _max_slots) {
-            _queue_cv.wait_for(lock, std::chrono::milliseconds(50),
-              [&] { return !_running || _queue.size() >= _max_slots; });
+          if (_encoded_queue.size() < _max_slots) {
+            _encoded_queue_cv.wait_for(lock, std::chrono::milliseconds(50),
+              [&] { return !_running || _encoded_queue.size() >= _max_slots; });
           }
 
-          // Drain the shared queue into ContinuousRequests.
-          while (!_queue.empty()) {
-            Request req = std::move(_queue.front());
-            _queue.pop();
+          // Drain the encoded queue into ContinuousRequests.
+          while (!_encoded_queue.empty()) {
+            Request req = std::move(_encoded_queue.front());
+            _encoded_queue.pop();
             local_queue.push(convert_request(req));
           }
         }

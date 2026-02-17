@@ -292,17 +292,24 @@ namespace ctranslate2 {
         std::vector<size_t> prompt;
       };
 
-      // Thread-safe request queue.
-      std::queue<Request> _queue;
-      mutable std::mutex _queue_mutex;
-      std::condition_variable _queue_cv;
+      // Raw request queue (un-encoded features from submit()).
+      std::queue<Request> _raw_queue;
+      mutable std::mutex _raw_queue_mutex;
+      std::condition_variable _raw_queue_cv;
+
+      // Encoded request queue (features already run through the encoder).
+      std::queue<Request> _encoded_queue;
+      mutable std::mutex _encoded_queue_mutex;
+      std::condition_variable _encoded_queue_cv;
 
       // Results storage.
       std::unordered_map<size_t, WhisperGenerationResult> _results;
       mutable std::mutex _results_mutex;
       std::condition_variable _results_cv;
 
-      // Worker thread.
+      // Encoder thread: encodes features from _raw_queue → _encoded_queue.
+      std::thread _encoder_thread;
+      // Worker thread: decodes from _encoded_queue.
       std::thread _worker;
       std::atomic<bool> _running{false};
       std::atomic<size_t> _next_id{0};
@@ -313,6 +320,7 @@ namespace ctranslate2 {
       std::unique_ptr<WhisperReplica> _replica;
       mutable std::mutex _replica_mutex;
 
+      void encoder_loop();
       void worker_loop();
     };
 
