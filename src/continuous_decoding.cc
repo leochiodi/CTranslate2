@@ -7,17 +7,9 @@
 
 #include "ctranslate2/devices.h"
 #include "ctranslate2/ops/ops.h"
+#include "ctranslate2/primitives.h"
+#include "ctranslate2/utils.h"
 #include "dispatch.h"
-
-// Debug logging for beam search — enable with CT2_BEAM_DEBUG=1
-static bool beam_debug_enabled() {
-  static int enabled = -1;
-  if (enabled < 0) {
-    const char* env = std::getenv("CT2_BEAM_DEBUG");
-    enabled = (env && std::string(env) == "1") ? 1 : 0;
-  }
-  return enabled == 1;
-}
 
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
@@ -265,7 +257,6 @@ namespace ctranslate2 {
       const layers::DecoderState& single_state,
       dim_t target_cache_len) {
     const Device device = batch_state.begin()->second.device();
-    const dim_t rows_per_slot = _beam_size;
 
     // On CUDA: collect all copy descriptors and execute in a single kernel launch.
     // On CPU: copy each tensor immediately.
@@ -293,9 +284,13 @@ namespace ctranslate2 {
       if (!single_value || !batch_value)
         continue;
 
+      // Memory tensors are at slot-level (1 row per slot), others at beam-level.
+      const bool is_mem = starts_with(name, "memory");
+      const dim_t rows_per_slot = is_mem ? 1 : _beam_size;
+
       const bool is_cache = (name.find("keys_") != std::string::npos
                              || name.find("values_") != std::string::npos);
-      if (is_cache && single_value.rank() >= 3) {
+      if (is_cache && !is_mem && single_value.rank() >= 3) {
         const dim_t time_dim = single_value.rank() == 4 ? 2 : 1;
         pad_cache(single_value, target_cache_len, time_dim);
       }
@@ -303,8 +298,7 @@ namespace ctranslate2 {
       if (batch_value.rank() < 1)
         continue;
 
-      // For beam search: single_state has rows_per_slot rows for this slot.
-      // Copy them into batch rows [slot_idx * rows_per_slot, ...).
+      // Copy rows_per_slot rows into batch at [slot_idx * rows_per_slot, ...).
       const dim_t slot_size_per_row = batch_value.size() / batch_value.dim(0);
       const dim_t expected_single_size = slot_size_per_row * rows_per_slot;
       if (single_value.size() != expected_single_size)
@@ -369,9 +363,12 @@ namespace ctranslate2 {
     const dim_t prompt_length = request.prompt_tokens.size();
 
     // For beam search: replicate the single-element state beam_size times.
+    // Skip memory* tensors — they stay at slot-level (one per request).
     if (_beam_size > 1) {
       for (auto& [name, value] : single_state) {
         if (!value || name.find("_retain_memory") != std::string::npos)
+          continue;
+        if (starts_with(name, "memory"))
           continue;
         if (value.dim(0) == 1) {
           value.expand_dims(1);
@@ -390,7 +387,7 @@ namespace ctranslate2 {
     if (target_len > 0) {
       set_batch_slot(batch_state, slot_idx, single_state, target_len);
     } else {
-      // First element — pad single_state from beam_size to total_batch rows.
+      // First element — pad single_state to full batch dimensions.
       const Device device = _decoder.device();
       const dim_t total_batch = static_cast<dim_t>(_max_slots) * _beam_size;
 
@@ -398,11 +395,16 @@ namespace ctranslate2 {
         if (!value || value.rank() < 1 || name.find("_retain_memory") != std::string::npos)
           continue;
 
+        // Memory tensors: dim(0)=1 (slot-level), pad to max_slots.
+        // Other tensors: dim(0)=beam_size, pad to total_batch.
+        const bool is_mem = starts_with(name, "memory");
+        const dim_t expected = is_mem ? 1 : _beam_size;
+        const dim_t target = is_mem ? static_cast<dim_t>(_max_slots) : total_batch;
         const dim_t current_batch = value.dim(0);
-        if (current_batch == _beam_size && total_batch > _beam_size) {
-          // Expand batch dimension: pad with zeros from beam_size to total_batch.
+
+        if (current_batch == expected && target > expected) {
           Shape pad_shape = value.shape();
-          pad_shape[0] = total_batch - current_batch;
+          pad_shape[0] = target - current_batch;
           StorageView padding(std::move(pad_shape), value.dtype(), device);
           DEVICE_AND_TYPE_DISPATCH(device, value.dtype(),
             primitives<D>::fill(padding.data<T>(), T(0), padding.size()));
@@ -506,10 +508,16 @@ namespace ctranslate2 {
       is.prompt_length = static_cast<dim_t>(is.request.prompt_tokens.size());
       max_prompt_len = std::max(max_prompt_len, is.prompt_length);
 
-      // Beam replication.
+      // Beam replication — skip memory* tensors (cross-attention K/V cache,
+      // encoder output, memory_lengths).  These stay at slot-level (one row
+      // per request, not per beam), matching the standard generate() path.
+      // The attention layer's beam_size computation handles the mismatch:
+      //   beam_size = queries.dim(0) / cached_keys.dim(0)
       if (_beam_size > 1) {
         for (auto& [name, value] : is.single_state) {
           if (!value || name.find("_retain_memory") != std::string::npos)
+            continue;
+          if (starts_with(name, "memory"))
             continue;
           if (value.dim(0) == 1) {
             value.expand_dims(1);
@@ -526,7 +534,6 @@ namespace ctranslate2 {
     // Build batch state by concatenating all initial states + zero padding.
     const dim_t num_initial = static_cast<dim_t>(initial_slots.size());
     const dim_t initial_batch = num_initial * _beam_size;
-    const dim_t pad_rows = total_batch - initial_batch;
 
     layers::DecoderState batch_state;
 
@@ -572,10 +579,16 @@ namespace ctranslate2 {
         concat_batch(parts, concatenated);
       }
 
-      // Pad remaining batch rows with zeros for inactive slots.
-      if (pad_rows > 0 && concatenated.dim(0) == initial_batch) {
+      // Pad remaining rows with zeros for inactive slots.
+      // Memory tensors are at slot-level (dim(0) = num_slots, not total_batch).
+      const bool is_mem = starts_with(name, "memory");
+      const dim_t expected_dim0 = is_mem ? num_initial : initial_batch;
+      const dim_t target_dim0 = is_mem ? static_cast<dim_t>(_max_slots) : total_batch;
+      const dim_t pad_amount = target_dim0 - expected_dim0;
+
+      if (pad_amount > 0 && concatenated.dim(0) == expected_dim0) {
         Shape pad_shape = concatenated.shape();
-        pad_shape[0] = pad_rows;
+        pad_shape[0] = pad_amount;
         StorageView padding(std::move(pad_shape), concatenated.dtype(), device);
         DEVICE_AND_TYPE_DISPATCH(device, concatenated.dtype(),
           primitives<D>::fill(padding.data<T>(), T(0), padding.size()));
@@ -648,6 +661,20 @@ namespace ctranslate2 {
     StorageView step_offsets({total_batch}, DataType::INT32);
     StorageView gather_indices_scratch({total_batch}, DataType::INT32);
 
+    // Beam score accumulator (CPU, float32) — mirrors decoding.cc's topk_scores.
+    // Used by add_depth_broadcast on GPU each step to merge beam scores with log probs.
+    StorageView beam_scores;
+    if (_beam_size > 1) {
+      beam_scores = StorageView({total_batch}, 0.0f);
+      for (size_t s = 0; s < _max_slots; ++s) {
+        const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
+        if (!slots[s].active)
+          beam_scores.at<float>(s_offset) = -1e9f;
+        for (dim_t b = 1; b < _beam_size; ++b)
+          beam_scores.at<float>(s_offset + b) = -1e9f;
+      }
+    }
+
     // Main decode loop.
     while (true) {
       // Recompute active count from slot states each iteration.
@@ -673,62 +700,73 @@ namespace ctranslate2 {
       // Store CPU step_offsets in batch_state so transformer.cc can skip GPU→CPU copy.
       batch_state["step_offsets_cpu"] = step_offsets;
 
-      // Debug: log inputs to decode step.
-      if (beam_debug_enabled() && _beam_size > 1) {
-        // Find gen_step from first active slot.
-        dim_t gs = -1;
-        for (const size_t s : active_slot_indices) { gs = slots[s].gen_step(); break; }
-        if (gs >= 0 && gs <= 5) {
-          fprintf(stderr, "[BEAM] === decode step, gen_step=%ld ===\n", (long)gs);
-          fprintf(stderr, "[BEAM]   step_offsets:");
-          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
-            fprintf(stderr, " %d", step_offsets.at<int32_t>(i));
-          fprintf(stderr, "\n[BEAM]   sample_from:");
-          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
-            fprintf(stderr, " %d", sample_from.at<int32_t>(i));
-          fprintf(stderr, "\n[BEAM]   cache_lengths:");
-          const auto& cl = batch_state["cache_lengths"];
-          for (dim_t i = 0; i < std::min(total_batch, dim_t(10)); ++i)
-            fprintf(stderr, " %d", cl.at<int32_t>(i));
-          fprintf(stderr, "\n");
-        }
-      }
-
       // Create GPU copy for the decode step (keep CPU scratch buffer intact).
       StorageView step_offsets_device(step_offsets);
       if (device != Device::CPU)
         step_offsets_device = step_offsets_device.to(device);
 
-      // Expand self-attention caches if any row's write position would exceed cache time.
-      // Also set cache_write_positions for scatter-based writes.
+      // Decide between fast concat path (like generate()) and scatter path.
+      //
+      // When all active slots have the same cache_length AND the cache has no
+      // padding (cache_time == cache_length), the self-attention K/V update can
+      // use the standard concat path and skip the attention mask entirely —
+      // matching the exact code path of model.generate().
+      //
+      // When cache_lengths differ (mid-decode slot insertion), we fall back to
+      // scatter writes with pre-allocated cache and per-row attention mask.
       {
-        // cache_lengths is kept on CPU to avoid GPU sync roundtrips.
         const auto& cache_lengths = batch_state["cache_lengths"];
         const dim_t current_cache_time = max_cache_length(batch_state);
 
-        dim_t max_cl = 0;
-        for (dim_t i = 0; i < cache_lengths.size(); ++i)
-          max_cl = std::max(max_cl, dim_t(cache_lengths.at<int32_t>(i)));
-
-        if (max_cl >= current_cache_time) {
-          // Grow in chunks to avoid per-step concat overhead.
-          // Round up to next multiple of chunk_size (or _max_length, whichever is smaller).
-          constexpr dim_t chunk_size = 64;
-          const dim_t target = std::min(
-            ((max_cl / chunk_size) + 1) * chunk_size,
-            _max_length);
-          for (auto& [name, value] : batch_state) {
-            if (name.find("self_keys_") != std::string::npos
-                || name.find("self_values_") != std::string::npos) {
-              pad_cache(value, target, /*time_dim=*/2);
+        // Check if all active cache_lengths are uniform.
+        bool uniform_cache = true;
+        int32_t common_cl = -1;
+        for (size_t s = 0; s < _max_slots; ++s) {
+          if (slots[s].active) {
+            int32_t cl = cache_lengths.at<int32_t>(
+              static_cast<dim_t>(s) * _beam_size);
+            if (common_cl < 0)
+              common_cl = cl;
+            else if (cl != common_cl) {
+              uniform_cache = false;
+              break;
             }
           }
         }
 
-        // Set cache_write_positions = cache_lengths (CPU).
-        // scatter_cache_step reads positions on CPU to build copy descriptors,
-        // so passing CPU positions avoids 8 GPU→CPU syncs per step (4 layers × K+V).
-        batch_state["cache_write_positions"] = cache_lengths;
+        // Fast concat path: cache has no padding and all slots are aligned.
+        // The attention layer will use concat (appending 1 step), no mask needed.
+        const bool use_concat_path =
+          uniform_cache && common_cl >= 0
+          && current_cache_time == static_cast<dim_t>(common_cl);
+
+        if (use_concat_path) {
+          // Signal transformer.cc to skip the self-attention mask.
+          batch_state["no_self_attn_mask"] = StorageView();
+          // Don't set cache_write_positions → attention layer uses concat.
+        } else {
+          batch_state.erase("no_self_attn_mask");
+
+          // Scatter path: pre-allocate cache and set write positions.
+          dim_t max_cl = 0;
+          for (dim_t i = 0; i < cache_lengths.size(); ++i)
+            max_cl = std::max(max_cl, dim_t(cache_lengths.at<int32_t>(i)));
+
+          if (max_cl >= current_cache_time) {
+            constexpr dim_t chunk_size = 64;
+            const dim_t target = std::min(
+              ((max_cl / chunk_size) + 1) * chunk_size,
+              _max_length);
+            for (auto& [name, value] : batch_state) {
+              if (name.find("self_keys_") != std::string::npos
+                  || name.find("self_values_") != std::string::npos) {
+                pad_cache(value, target, /*time_dim=*/2);
+              }
+            }
+          }
+
+          batch_state["cache_write_positions"] = cache_lengths;
+        }
       }
 
       // Run one decode step.
@@ -739,6 +777,7 @@ namespace ctranslate2 {
       // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");
       batch_state.erase("step_offsets_cpu");
+      batch_state.erase("no_self_attn_mask");
 
       // Accumulate cross-attention weights per step using pre-allocated buffer.
       // step_attention: [total_batch, num_alignment_heads, enc_time] (3D).
@@ -901,23 +940,47 @@ namespace ctranslate2 {
 
       } else {
         // --- Beam search path (beam_size > 1) ---
+        // Mirrors decoding.cc's BeamSearch::search(): add beam scores on GPU,
+        // reshape to [max_slots, beam*vocab], single TopK per slot.
 
-        // Compute log_softmax, then GPU TopK to avoid transferring full vocab to CPU.
-        StorageView log_probs(logits.dtype(), logits.device());
-        ops::LogSoftMax()(logits, log_probs);
+        // 1. In-place LogSoftMax (avoids separate allocation).
+        ops::LogSoftMax()(logits);
 
-        // GPU TopK: extract top 2*beam_size candidates per row,
-        // transfer only [total_batch, 2*beam_size] to CPU instead of full vocab.
-        const dim_t topk_k = 2 * _beam_size;
-        StorageView topk_values(log_probs.dtype(), log_probs.device());
-        StorageView topk_indices(DataType::INT32, log_probs.device());
-        const ops::TopK topk_op(topk_k);
-        topk_op(log_probs, topk_values, topk_indices);
+        // 2. Add cumulative beam scores on GPU via add_depth_broadcast.
+        //    Each beam row gets its cumulative score added to all vocab entries.
+        {
+          StorageView beam_scores_device(beam_scores);
+          if (device != Device::CPU) {
+            if (beam_scores_device.dtype() != logits.dtype())
+              beam_scores_device = beam_scores_device.to(logits.dtype());
+            beam_scores_device = beam_scores_device.to(device);
+          }
+          DEVICE_AND_TYPE_DISPATCH(logits.device(), logits.dtype(),
+            primitives<D>::add_depth_broadcast(beam_scores_device.data<T>(),
+                                               logits.data<T>(),
+                                               beam_scores_device.size(),
+                                               logits.size()));
+        }
 
-        if (topk_values.dtype() != DataType::FLOAT32)
-          topk_values = topk_values.to_float32();
-        topk_values = topk_values.to(Device::CPU);
-        topk_indices = topk_indices.to(Device::CPU);
+        // 3. Reshape [total_batch, vocab] → [max_slots, beam_size * vocab].
+        //    Zero-copy: same underlying data, different shape.
+        const dim_t vocab_size = logits.dim(-1);
+        logits.reshape({static_cast<dim_t>(_max_slots),
+                        _beam_size * vocab_size});
+
+        // 4. GPU TopK on merged beam×vocab space: [max_slots, 2*beam_size].
+        //    Finds globally best candidates across all beams in one kernel.
+        const dim_t num_candidates = 2 * _beam_size;
+        StorageView topk_scores_step(logits.dtype(), logits.device());
+        StorageView topk_ids(DataType::INT32, logits.device());
+        const ops::TopK topk_op(num_candidates);
+        topk_op(logits, topk_scores_step, topk_ids);
+
+        // 5. Transfer to CPU (only [max_slots, 2K] — much smaller than before).
+        if (topk_scores_step.dtype() != DataType::FLOAT32)
+          topk_scores_step = topk_scores_step.to_float32();
+        topk_scores_step = topk_scores_step.to(Device::CPU);
+        topk_ids = topk_ids.to(Device::CPU);
 
         // Reuse scratch buffer for gather indices.
         StorageView& gather_indices = gather_indices_scratch;
@@ -931,60 +994,35 @@ namespace ctranslate2 {
         for (const size_t s : active_slot_indices) {
           auto& slot = slots[s];
           const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
+          const dim_t s_dim = static_cast<dim_t>(s);
 
-          // Collect candidates across all beams for this slot.
-          struct Candidate {
-            dim_t beam;
-            size_t word_id;
-            float score;
-          };
-          std::vector<Candidate> candidates;
-          candidates.reserve(_beam_size * topk_k);
-
-          for (dim_t b = 0; b < _beam_size; ++b) {
-            if (slot.beam_finished[b])
-              continue;
-
-            const float* row_values = topk_values.index<float>({s_offset + b, 0});
-            const int32_t* row_indices = topk_indices.index<int32_t>({s_offset + b, 0});
-            const float beam_score = slot.beam_scores[b];
-
-            // Candidates already sorted by GPU TopK — just iterate.
-            for (dim_t k = 0; k < topk_k; ++k) {
-              candidates.push_back(Candidate{b, static_cast<size_t>(row_indices[k]),
-                                             beam_score + row_values[k]});
-            }
-          }
-
-          // Sort all candidates by score descending.
-          std::sort(candidates.begin(), candidates.end(),
-                    [](const Candidate& a, const Candidate& b) {
-                      return a.score > b.score;
-                    });
-
-          // Select top beam_size non-finished candidates.
-          std::vector<dim_t> new_beam_from(_beam_size, -1);  // Which old beam each new beam comes from.
+          // Iterate globally-sorted candidates (already ranked by TopK).
+          // Unflatten: flat_id = beam_id * vocab_size + word_id.
+          std::vector<dim_t> new_beam_from(_beam_size, -1);
           std::vector<size_t> new_beam_token(_beam_size, 0);
           std::vector<float> new_beam_score(_beam_size, -1e9f);
           dim_t filled = 0;
 
-          for (const auto& cand : candidates) {
-            if (filled >= _beam_size)
-              break;
+          for (dim_t k = 0; k < num_candidates && filled < _beam_size; ++k) {
+            const int32_t flat_id = topk_ids.at<int32_t>({s_dim, k});
+            const float score = topk_scores_step.at<float>({s_dim, k});
+            const dim_t beam_id = flat_id / vocab_size;
+            const size_t word_id = flat_id % vocab_size;
 
-            if (is_eos(cand.word_id, _end_ids)) {
+            if (slot.beam_finished[beam_id])
+              continue;
+
+            if (is_eos(word_id, _end_ids)) {
               // This beam produced EOT — record hypothesis.
-              std::vector<size_t> hyp_tokens = slot.beam_tokens[cand.beam];
-              // Don't include EOT in hypothesis.
+              std::vector<size_t> hyp_tokens = slot.beam_tokens[beam_id];
               const float hyp_len = static_cast<float>(hyp_tokens.size() + 1);
-              const float normalized_score = cand.score / std::pow(hyp_len, _length_penalty);
+              const float normalized_score = score / std::pow(hyp_len, _length_penalty);
 
               slot.finished_hypotheses.push_back(
                 SlotState::Hypothesis{std::move(hyp_tokens), normalized_score});
               slot.num_finished_beams++;
 
               if (slot.num_finished_beams >= _max_candidates) {
-                // Slot is done — fill remaining beams with dummy.
                 while (filled < _beam_size) {
                   new_beam_from[filled] = 0;
                   new_beam_token[filled] = 0;
@@ -996,9 +1034,9 @@ namespace ctranslate2 {
               continue;
             }
 
-            new_beam_from[filled] = cand.beam;
-            new_beam_token[filled] = cand.word_id;
-            new_beam_score[filled] = cand.score;
+            new_beam_from[filled] = beam_id;
+            new_beam_token[filled] = word_id;
+            new_beam_score[filled] = score;
             filled++;
           }
 
@@ -1051,8 +1089,6 @@ namespace ctranslate2 {
                 ops::Gather()(accum, slot_idx, cr.attention_weights);
                 cr.attention_weights.squeeze(0);  // [heads, capacity, enc_time]
 
-                // Slice [offset, attention_time) to trim both the pre-alloc
-                // capacity padding and any prior slot's data.
                 const dim_t offset = slot.attention_step_offset;
                 const dim_t slot_time = attention_time - offset;
                 if (slot_time > 0 && slot_time < cr.attention_weights.dim(1)) {
@@ -1070,7 +1106,10 @@ namespace ctranslate2 {
             slot.active = false;
             finished_slots.push_back(s);
 
-            // Keep identity gather for this slot's rows.
+            // Mark finished slot's beam scores as -inf.
+            for (dim_t b = 0; b < _beam_size; ++b)
+              beam_scores.at<float>(s_offset + b) = -1e9f;
+
             continue;
           }
 
@@ -1086,7 +1125,6 @@ namespace ctranslate2 {
           slot.beam_scores = std::move(new_beam_score);
           slot.step++;
 
-          // Also update generated_tokens with best beam's last token for compatibility.
           if (!slot.beam_tokens.empty() && !slot.beam_tokens[0].empty())
             slot.generated_tokens = slot.beam_tokens[0];
 
@@ -1097,23 +1135,13 @@ namespace ctranslate2 {
           }
 
           // Update sample_from for this slot's beams.
-          for (dim_t b = 0; b < _beam_size; ++b) {
+          for (dim_t b = 0; b < _beam_size; ++b)
             sample_from.at<int32_t>(s_offset + b) = new_beam_token[b];
-          }
 
-          // Debug logging.
-          if (beam_debug_enabled() && slot.gen_step() <= 5) {
-            fprintf(stderr, "[BEAM] slot=%zu gen_step=%ld  beams:", s, (long)slot.gen_step());
-            for (dim_t b = 0; b < _beam_size; ++b)
-              fprintf(stderr, " [%ld->%ld tok=%zu sc=%.2f]",
-                      (long)b, (long)slot.beam_tokens[b].size(),
-                      slot.beam_tokens[b].empty() ? 0 : slot.beam_tokens[b].back(),
-                      slot.beam_scores[b]);
-            fprintf(stderr, "  gather:");
-            for (dim_t b = 0; b < _beam_size; ++b)
-              fprintf(stderr, " %d", gather_indices.at<int32_t>(s_offset + b));
-            fprintf(stderr, "\n");
-          }
+          // Update beam_scores accumulator with selected cumulative scores.
+          for (dim_t b = 0; b < _beam_size; ++b)
+            beam_scores.at<float>(s_offset + b) = slot.beam_scores[b];
+
         }
 
         // Apply beam reordering to all state tensors (skip if identity permutation).
@@ -1131,6 +1159,13 @@ namespace ctranslate2 {
               continue;
             if (name == "cache_lengths")
               continue;
+            // Cross-attention caches (memory_keys_*, memory_values_*) and encoder
+            // output (memory) are identical across beams within a slot — skip them.
+            if (starts_with(name, "memory"))
+              continue;
+            // accumulated_attention is indexed by slot, not reordered by beam.
+            if (name == "accumulated_attention")
+              continue;
             if (value && value.dim(0) == total_batch)
               ops::Gather()(value, gather_device);
           }
@@ -1139,8 +1174,14 @@ namespace ctranslate2 {
         // Mid-decode slot filling for beam search path.
         for (const size_t s : finished_slots) {
           fill_slot(s, request_queue, queue_provider, slots, batch_state);
-          if (slots[s].active)
+          if (slots[s].active) {
             slots[s].attention_step_offset = attention_time;
+            // Reset beam scores for newly filled slot.
+            const dim_t s_off = static_cast<dim_t>(s) * _beam_size;
+            beam_scores.at<float>(s_off) = 0.0f;
+            for (dim_t b = 1; b < _beam_size; ++b)
+              beam_scores.at<float>(s_off + b) = -1e9f;
+          }
         }
       }
 
@@ -1153,6 +1194,13 @@ namespace ctranslate2 {
           if (!fill_slot(s, request_queue, queue_provider, slots, batch_state))
             break;  // No more requests available.
           slots[s].attention_step_offset = attention_time;
+          // Reset beam scores for newly filled slot.
+          if (_beam_size > 1) {
+            const dim_t s_off = static_cast<dim_t>(s) * _beam_size;
+            beam_scores.at<float>(s_off) = 0.0f;
+            for (dim_t b = 1; b < _beam_size; ++b)
+              beam_scores.at<float>(s_off + b) = -1e9f;
+          }
         }
       }
 

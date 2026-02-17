@@ -914,8 +914,13 @@ namespace ctranslate2 {
 
       // Build per-element attention mask using cache_lengths from state if available.
       // cache_lengths tracks valid (non-padded) cache entries per element.
+      //
+      // When "no_self_attn_mask" is set, all cache_lengths are identical and
+      // the cache has no padding — we can skip the mask entirely, matching the
+      // standard generate() code path (no mask for self-attention).
+      const bool skip_self_mask = state.count("no_self_attn_mask") > 0;
       const auto cache_lengths_it = state.find("cache_lengths");
-      if (cache_lengths_it != state.end()) {
+      if (cache_lengths_it != state.end() && !skip_self_mask) {
         dim_t num_heads = _num_heads;
         if (_tensor_parallel)
           num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());

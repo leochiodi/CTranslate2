@@ -1,14 +1,19 @@
 """
 Benchmark: old model.generate() vs continuous batching
-Both with beam_size=5, 4 concurrent requests, ~11s audio (jfk.npy = 176000 samples = 11s)
+Both with beam_size=5, 4 concurrent requests, 35s real French audio.
 """
+import os
 import time
 import numpy as np
+import soundfile as sf
 
 from ctranslate2._ext import StorageView, WhisperContinuousBatcher
 import ctranslate2
 
-MODEL_PATH = "models/whisper-large-v3"
+MODEL_PATH = os.environ.get("WHISPER_MODEL",
+    "../ctranslate2-server/models/whisper-large-v3")
+AUDIO_PATH = os.environ.get("AUDIO_PATH",
+    "../ctranslate2-server/f1_35s.wav")
 DEVICE = "cuda"
 DEVICE_INDEX = 0
 COMPUTE_TYPE = "float16"
@@ -21,9 +26,15 @@ from faster_whisper.feature_extractor import FeatureExtractor
 from faster_whisper.audio import pad_or_trim
 
 fe = FeatureExtractor(feature_size=128)
-waveform = np.load("tests/data/audio/jfk.npy")
+waveform, sr = sf.read(AUDIO_PATH, dtype="float32")
+if waveform.ndim > 1:
+    waveform = waveform.mean(axis=1)
+if sr != 16000:
+    import torchaudio, torch
+    waveform = torchaudio.transforms.Resample(sr, 16000)(
+        torch.from_numpy(waveform).unsqueeze(0)).squeeze(0).numpy()
 audio_duration = len(waveform) / 16000
-print(f"Audio duration: {audio_duration:.1f}s")
+print(f"Audio: {AUDIO_PATH} ({audio_duration:.1f}s)")
 
 mel = fe(waveform)
 mel = pad_or_trim(mel, length=fe.nb_max_frames)
@@ -34,7 +45,7 @@ import tokenizers
 hf_tok = tokenizers.Tokenizer.from_file(f"{MODEL_PATH}/tokenizer.json")
 
 from faster_whisper.tokenizer import Tokenizer
-tokenizer = Tokenizer(hf_tok, multilingual=True, task="transcribe", language="en")
+tokenizer = Tokenizer(hf_tok, multilingual=True, task="transcribe", language="fr")
 prompt = list(tokenizer.sot_sequence)
 print(f"Prompt tokens: {prompt}")
 

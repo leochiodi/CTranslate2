@@ -879,6 +879,11 @@ namespace ctranslate2 {
 
     void WhisperContinuousBatcher::encoder_loop() {
       const auto scoped_device_setter = _model->get_scoped_device_setter();
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
       const Device device = _model->device();
       const DataType dtype = _encoder->output_type();
 
@@ -964,6 +969,13 @@ namespace ctranslate2 {
 
     void WhisperContinuousBatcher::worker_loop() {
       const auto scoped_device_setter = _model->get_scoped_device_setter();
+
+#ifdef CT2_WITH_CUDA
+      // Match generate(): use fp32 accumulation for fp16 GEMMs.
+      // Without this, cuBLAS selects much slower COMPUTE_16F kernels.
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
       _decoder->update_output_layer(_model->preferred_size_multiple());
 
       // Set up sampler based on options.
@@ -1047,11 +1059,13 @@ namespace ctranslate2 {
       }
 
       // Set alignment heads for cross-attention capture during decode.
+      // CT2_NO_ATTN_CAPTURE=1 disables capture for profiling/testing.
       bool capture_attention = false;
       const auto ah = _model->config.find("alignment_heads");
       if (ah != _model->config.end()) {
         _decoder->set_alignment_heads(ah->get<std::vector<std::pair<dim_t, dim_t>>>());
-        capture_attention = true;
+        const char* no_attn = std::getenv("CT2_NO_ATTN_CAPTURE");
+        capture_attention = !(no_attn && std::string(no_attn) == "1");
       }
 
       ContinuousDecodingEngine engine(
