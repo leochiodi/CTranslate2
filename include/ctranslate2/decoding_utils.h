@@ -46,10 +46,8 @@ namespace ctranslate2 {
         _logits_data[flat_index] = _disable_value;
 
       } else {
-        // On GPU we prepare a list of unique index to disable.
-        const auto it = std::lower_bound(_flat_indices.begin(), _flat_indices.end(), flat_index);
-        if (it == _flat_indices.end() || *it != flat_index)
-          _flat_indices.insert(it, flat_index);
+        // On GPU: just append. indexed_fill is idempotent so duplicates are harmless.
+        _flat_indices.push_back(flat_index);
       }
     }
 

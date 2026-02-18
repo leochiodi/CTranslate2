@@ -1,6 +1,7 @@
 #include "ctranslate2/continuous_decoding.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -770,8 +771,21 @@ namespace ctranslate2 {
     StorageView step_offsets({total_batch}, DataType::INT32);
     StorageView gather_indices_scratch({total_batch}, DataType::INT32);
 
+    // --- Step-level timing instrumentation ---
+    using Clock = std::chrono::high_resolution_clock;
+    double t_slot_mgmt = 0, t_cache_pad = 0, t_step_setup = 0;
+    double t_decoder = 0, t_attn_accum = 0, t_logits_proc = 0, t_selection = 0;
+    double t_resize_up = 0, t_defrag = 0, t_fill = 0, t_rebuild = 0;
+    size_t step_count = 0;
+    auto t_loop_start = Clock::now();
+
+    auto elapsed_ms = [](Clock::time_point a, Clock::time_point b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
     // Main decode loop.
     while (true) {
+      auto t0 = Clock::now();
       // Count active slots. After defragmentation, active slots are always
       // contiguous at positions 0..active_count-1.
       active_count = 0;
@@ -786,6 +800,9 @@ namespace ctranslate2 {
       const dim_t active_batch = static_cast<dim_t>(active_count) * _beam_size;
       std::vector<size_t> active_slot_indices(active_count);
       std::iota(active_slot_indices.begin(), active_slot_indices.end(), 0);
+
+      auto t1 = Clock::now();
+      t_slot_mgmt += elapsed_ms(t0, t1);
 
       // --- Determine concat vs scatter path (at MAX size, before resize) ---
       // Concat path is only allowed when ALL slots are active (active_count == max_slots)
@@ -836,6 +853,9 @@ namespace ctranslate2 {
         }
       }
 
+      auto t2 = Clock::now();
+      t_cache_pad += elapsed_ms(t1, t2);
+
       // --- Resize batch_state DOWN to active dimensions ---
       // StorageView::resize() to a smaller dim(0) is free (no reallocation).
       if (active_count < _max_slots)
@@ -876,10 +896,16 @@ namespace ctranslate2 {
       for (dim_t i = 0; i < active_batch; ++i)
         active_sample_from.at<int32_t>(i) = sample_from.at<int32_t>(i);
 
+      auto t3 = Clock::now();
+      t_step_setup += elapsed_ms(t2, t3);
+
       // Run one decode step with only active_batch rows.
       StorageView step_attention(device);
       _decoder(step_offsets_device, active_sample_from.to(device), batch_state, &logits,
                _capture_attention ? &step_attention : nullptr);
+      synchronize_stream(device);  // PROFILING ONLY: force sync to measure decoder time
+      auto t4 = Clock::now();
+      t_decoder += elapsed_ms(t3, t4);
 
       // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");
@@ -982,11 +1008,17 @@ namespace ctranslate2 {
         attention_time++;
       }
 
+      auto t5 = Clock::now();
+      t_attn_accum += elapsed_ms(t4, t5);
+
       // Apply logits processors.
       DisableTokens disable_tokens(logits);
       for (const auto& proc : _logits_processors)
         proc->apply(slots, active_slot_indices, _beam_size, logits, disable_tokens);
       disable_tokens.apply();
+
+      auto t6 = Clock::now();
+      t_logits_proc += elapsed_ms(t5, t6);
 
       // --- Greedy path (beam_size == 1) ---
       std::vector<size_t> finished_slots;
@@ -1260,15 +1292,24 @@ namespace ctranslate2 {
         }
       }
 
+      auto t7 = Clock::now();
+      t_selection += elapsed_ms(t6, t7);
+
       // --- Resize back (greedy path — beam path already resized above) ---
       if (_beam_size == 1 && active_count < _max_slots)
         resize_batch_state(batch_state, static_cast<dim_t>(_max_slots));
+
+      auto t8 = Clock::now();
+      t_resize_up += elapsed_ms(t7, t8);
 
       // --- Defragment: compact active slots to positions 0..N-1 ---
       // This ensures the contiguity invariant for the next iteration.
       if (!finished_slots.empty()) {
         active_count = defragment_slots(slots, batch_state);
       }
+
+      auto t9 = Clock::now();
+      t_defrag += elapsed_ms(t8, t9);
 
       if (active_count == 0)
         break;
@@ -1284,6 +1325,9 @@ namespace ctranslate2 {
         }
         ++active_count;
       }
+
+      auto t10 = Clock::now();
+      t_fill += elapsed_ms(t9, t10);
 
       if (active_count == 0)
         break;
@@ -1340,6 +1384,25 @@ namespace ctranslate2 {
         }
       }
 
+      auto t11 = Clock::now();
+      t_rebuild += elapsed_ms(t10, t11);
+      ++step_count;
+    }
+
+    // --- Log step-level timing summary ---
+    if (step_count > 0) {
+      const double total_ms = elapsed_ms(t_loop_start, Clock::now());
+      const double per_step = total_ms / step_count;
+      const double gpu_pct = 100.0 * t_decoder / total_ms;
+      fprintf(stderr,
+        "[DECODE PROFILE] steps=%zu  total=%.1fms  per_step=%.2fms  GPU%%=%.1f%%\n"
+        "  slot_mgmt=%.1f  cache_pad=%.1f  step_setup=%.1f  DECODER=%.1f\n"
+        "  attn_accum=%.1f  logits=%.1f  selection=%.1f  resize_up=%.1f\n"
+        "  defrag=%.1f  fill=%.1f  rebuild=%.1f\n",
+        step_count, total_ms, per_step, gpu_pct,
+        t_slot_mgmt, t_cache_pad, t_step_setup, t_decoder,
+        t_attn_accum, t_logits_proc, t_selection, t_resize_up,
+        t_defrag, t_fill, t_rebuild);
     }
 
     // Synchronize the CUDA stream before returning. This ensures all async
