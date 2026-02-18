@@ -204,7 +204,6 @@ namespace ctranslate2 {
       const std::vector<size_t>& end_ids,
       dim_t max_length,
       const Sampler& sampler,
-      SlotInitializer slot_initializer,
       std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors,
       bool capture_attention)
     : _decoder(decoder)
@@ -216,7 +215,6 @@ namespace ctranslate2 {
     , _end_ids(end_ids)
     , _max_length(max_length)
     , _sampler(sampler)
-    , _slot_initializer(std::move(slot_initializer))
     , _logits_processors(std::move(logits_processors))
     , _capture_attention(capture_attention)
   {
@@ -355,13 +353,9 @@ namespace ctranslate2 {
       return false;
     }
 
-    // Create a single-element state and initialize it via forward_prompt.
-    layers::DecoderState single_state = _decoder.initial_state(/*iterative_decoding=*/true);
-    single_state["memory"] = std::move(request.encoder_output);
-
-    _slot_initializer(_decoder, single_state, request);
-
-    const dim_t prompt_length = request.prompt_tokens.size();
+    // Use the pre-prepared state from encoder_loop (encode + forward_prompt already done).
+    layers::DecoderState single_state = std::move(request.prepared_state);
+    const dim_t prompt_length = request.prompt_length;
 
     // For beam search: replicate the single-element state beam_size times.
     // Skip memory* tensors — they stay at slot-level (one per request).
@@ -612,10 +606,9 @@ namespace ctranslate2 {
     // Process each request: encode + forward_prompt + beam replication.
     dim_t max_prompt_len = 0;
     for (auto& is : initial_slots) {
-      is.single_state = _decoder.initial_state(/*iterative_decoding=*/true);
-      is.single_state["memory"] = std::move(is.request.encoder_output);
-      _slot_initializer(_decoder, is.single_state, is.request);
-      is.prompt_length = static_cast<dim_t>(is.request.prompt_tokens.size());
+      // Use pre-prepared state from encoder_loop (encode + forward_prompt done).
+      is.single_state = std::move(is.request.prepared_state);
+      is.prompt_length = is.request.prompt_length;
       max_prompt_len = std::max(max_prompt_len, is.prompt_length);
 
       // Beam replication — skip memory* tensors (cross-attention K/V cache,
@@ -903,9 +896,10 @@ namespace ctranslate2 {
       StorageView step_attention(device);
       _decoder(step_offsets_device, active_sample_from.to(device), batch_state, &logits,
                _capture_attention ? &step_attention : nullptr);
-      synchronize_stream(device);  // PROFILING ONLY: force sync to measure decoder time
       auto t4 = Clock::now();
       t_decoder += elapsed_ms(t3, t4);
+      // Note: without sync, t_decoder captures launch time, not GPU time.
+      // For production this is fine; add synchronize_stream(device) here for profiling.
 
       // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");

@@ -14,10 +14,13 @@
 namespace ctranslate2 {
 
   // A request to be processed by the continuous batching engine.
+  // The prepared_state contains the decoder state after forward_prompt
+  // (KV caches initialized with prompt tokens, cross-attention projected).
+  // NOT beam-replicated — fill_slot handles that.
   struct ContinuousRequest {
     size_t id;
-    StorageView encoder_output;           // [1, T_enc, D] — pre-encoded features
-    std::vector<size_t> prompt_tokens;    // tokens for forward_prompt (sot, lang, task, ...)
+    layers::DecoderState prepared_state;  // after forward_prompt, single-element
+    dim_t prompt_length = 0;
     std::vector<size_t> start_tokens;     // tokens to start autoregressive decode
     bool use_timestamps = true;           // whether timestamp rules apply to this request
   };
@@ -150,14 +153,6 @@ namespace ctranslate2 {
   // and their outputs are ignored.
   class ContinuousDecodingEngine {
   public:
-    // Callback to initialize a slot's decoder state (encode + forward_prompt).
-    // Receives: the decoder, a single-element state, the request.
-    // Must fill the state's KV caches via forward_prompt.
-    using SlotInitializer = std::function<void(
-        layers::Decoder& decoder,
-        layers::DecoderState& state,
-        const ContinuousRequest& request)>;
-
     ContinuousDecodingEngine(
         layers::Decoder& decoder,
         size_t max_slots,
@@ -168,7 +163,6 @@ namespace ctranslate2 {
         const std::vector<size_t>& end_ids,
         dim_t max_length,
         const Sampler& sampler,
-        SlotInitializer slot_initializer,
         std::vector<std::shared_ptr<ContinuousLogitsProcessor>> logits_processors = {},
         bool capture_attention = false);
 
@@ -192,7 +186,6 @@ namespace ctranslate2 {
     const std::vector<size_t> _end_ids;
     const dim_t _max_length;
     const Sampler& _sampler;
-    SlotInitializer _slot_initializer;
     std::vector<std::shared_ptr<ContinuousLogitsProcessor>> _logits_processors;
     const bool _capture_attention;
 

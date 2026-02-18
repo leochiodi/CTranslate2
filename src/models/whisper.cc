@@ -752,6 +752,7 @@ namespace ctranslate2 {
       const auto scoped_device_setter = _model->get_scoped_device_setter();
       _encoder = std::make_unique<layers::WhisperEncoder>(*_model, "encoder");
       _decoder = std::make_unique<layers::WhisperDecoder>(*_model, "decoder");
+      _prep_decoder = std::make_unique<layers::WhisperDecoder>(*_model, "decoder");
 
       const auto& vocabulary = _model->get_vocabulary();
       _sot_id = vocabulary.bos_id();
@@ -773,7 +774,11 @@ namespace ctranslate2 {
       const size_t id = _next_id.fetch_add(1);
       {
         std::lock_guard<std::mutex> lock(_raw_queue_mutex);
-        _raw_queue.push(Request{id, std::move(features), std::move(prompt)});
+        Request req;
+        req.id = id;
+        req.features = std::move(features);
+        req.prompt = std::move(prompt);
+        _raw_queue.push(std::move(req));
       }
       _raw_queue_cv.notify_one();
       return id;
@@ -811,6 +816,7 @@ namespace ctranslate2 {
         _encoder_thread.join();
       if (_worker.joinable())
         _worker.join();
+
     }
 
     StorageView WhisperContinuousBatcher::encode(StorageView features, bool to_cpu) {
@@ -954,10 +960,40 @@ namespace ctranslate2 {
           }
         }
 
+        // Run forward_prompt for each request to pre-compute KV caches.
+        // This runs on the encoder thread's CUDA stream, overlapping with
+        // the worker thread's decode loop on its own stream.
+        for (auto& req : requests) {
+          const size_t pl = get_prompt_length(req.prompt, _sot_id, _no_timestamps_id);
+          req.use_timestamps = std::find(req.prompt.begin(), req.prompt.end(),
+                                          _no_timestamps_id) == req.prompt.end();
+
+          std::vector<size_t> prompt_tokens;
+          if (pl <= 1) {
+            req.start_tokens = std::move(req.prompt);
+          } else {
+            prompt_tokens.assign(req.prompt.begin(), req.prompt.begin() + pl - 1);
+            req.start_tokens.assign(req.prompt.begin() + pl - 1, req.prompt.end());
+          }
+
+          req.prepared_state = _prep_decoder->initial_state(/*iterative_decoding=*/true);
+          req.prepared_state["memory"] = std::move(req.features);
+          req.prepared_state["_retain_memory"] = StorageView();
+
+          if (!prompt_tokens.empty()) {
+            StorageView input_ids = layers::make_sequence_inputs(
+              {prompt_tokens}, device);
+            _prep_decoder->forward_prompt(input_ids, req.prepared_state);
+          }
+
+          req.prepared_state.erase("_retain_memory");
+          req.prompt_length = static_cast<dim_t>(prompt_tokens.size());
+        }
+
         // Ensure GPU writes are visible to the worker thread's stream.
         synchronize_stream(device);
 
-        // Push encoded requests to the encoded queue.
+        // Push prepared requests to the encoded queue.
         {
           std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
           for (auto& req : requests)
@@ -985,34 +1021,6 @@ namespace ctranslate2 {
           _options.sampling_topk, 1.0f, _options.sampling_temperature);
       else
         sampler = std::make_unique<BestSampler>();
-
-      // Slot initializer: encode features and run forward_prompt.
-      auto slot_init = [this](layers::Decoder& decoder,
-                              layers::DecoderState& state,
-                              const ContinuousRequest& request) {
-        const Device device = _model->device();
-        const DataType dtype = _encoder->output_type();
-
-        // Encode features if not already encoded.
-        StorageView& memory = state["memory"];
-        memory.move_to(device, dtype);
-        if (!_encoder->is_encoded(memory)) {
-          StorageView encoded(dtype, device);
-          (*_encoder)(memory, encoded);
-          state["memory"] = std::move(encoded);
-        }
-
-        // Keep memory across forward_prompt (standard decode erases it at step 0).
-        state["_retain_memory"] = StorageView();
-
-        if (!request.prompt_tokens.empty()) {
-          StorageView input_ids = layers::make_sequence_inputs(
-            {request.prompt_tokens}, device);
-          _decoder->forward_prompt(input_ids, state);
-        }
-
-        state.erase("_retain_memory");
-      };
 
       const auto& vocabulary = _model->get_vocabulary();
 
@@ -1078,35 +1086,23 @@ namespace ctranslate2 {
         {_eot_id},
         _options.max_length,
         *sampler,
-        std::move(slot_init),
         std::move(logits_processors),
         capture_attention);
 
-      // Helper: convert internal Request to ContinuousRequest.
-      auto convert_request = [this](Request& req) -> ContinuousRequest {
-        const size_t pl = get_prompt_length(req.prompt, _sot_id, _no_timestamps_id);
-
+      // Helper: convert prepared Request to ContinuousRequest.
+      // Prompt splitting + forward_prompt already done in encoder_loop.
+      auto convert_request = [](Request& req) -> ContinuousRequest {
         ContinuousRequest cr;
         cr.id = req.id;
-        cr.encoder_output = std::move(req.features);
-
-        // Detect whether timestamps are active (no_timestamps token NOT in prompt).
-        cr.use_timestamps = std::find(req.prompt.begin(), req.prompt.end(),
-                                      _no_timestamps_id) == req.prompt.end();
-
-        if (pl <= 1) {
-          cr.start_tokens = std::move(req.prompt);
-        } else {
-          cr.prompt_tokens.assign(req.prompt.begin(),
-                                  req.prompt.begin() + pl - 1);
-          cr.start_tokens.assign(req.prompt.begin() + pl - 1,
-                                 req.prompt.end());
-        }
+        cr.prepared_state = std::move(req.prepared_state);
+        cr.prompt_length = req.prompt_length;
+        cr.start_tokens = std::move(req.start_tokens);
+        cr.use_timestamps = req.use_timestamps;
         return cr;
       };
 
       // QueueProvider: allows the engine to pull new requests mid-decode.
-      // Reads from _encoded_queue so features are already encoded.
+      // Reads from _encoded_queue which now carries fully prepared requests.
       QueueProvider queue_provider = [this, &convert_request]()
           -> std::optional<ContinuousRequest> {
         std::lock_guard<std::mutex> lock(_encoded_queue_mutex);

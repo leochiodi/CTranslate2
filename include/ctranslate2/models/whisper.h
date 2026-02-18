@@ -276,6 +276,7 @@ namespace ctranslate2 {
       std::shared_ptr<const WhisperModel> _model;
       std::unique_ptr<layers::WhisperEncoder> _encoder;
       std::unique_ptr<layers::WhisperDecoder> _decoder;
+      std::unique_ptr<layers::WhisperDecoder> _prep_decoder;  // for encoder_loop's forward_prompt
 
       size_t _max_slots;
       WhisperOptions _options;
@@ -285,11 +286,18 @@ namespace ctranslate2 {
       size_t _no_timestamps_id;
       size_t _no_speech_id;
 
-      // Internal request type (carries raw features).
+      // Internal request type.
+      // Raw requests (from submit) carry features + prompt.
+      // After encoder_loop: features consumed, prepared_state populated.
       struct Request {
         size_t id;
         StorageView features;
         std::vector<size_t> prompt;
+        // Set by encoder_loop after encode + forward_prompt:
+        layers::DecoderState prepared_state;
+        dim_t prompt_length = 0;
+        std::vector<size_t> start_tokens;
+        bool use_timestamps = true;
       };
 
       // Raw request queue (un-encoded features from submit()).
@@ -297,7 +305,7 @@ namespace ctranslate2 {
       mutable std::mutex _raw_queue_mutex;
       std::condition_variable _raw_queue_cv;
 
-      // Encoded request queue (features already run through the encoder).
+      // Prepared request queue (encoded + forward_prompt KV caches ready).
       std::queue<Request> _encoded_queue;
       mutable std::mutex _encoded_queue_mutex;
       std::condition_variable _encoded_queue_cv;
