@@ -214,6 +214,23 @@ namespace ctranslate2 {
 
     // Get the current max cache length across all active slots.
     dim_t max_cache_length(const layers::DecoderState& batch_state) const;
+
+    // Resize all batch_state tensors to target_count active slots.
+    // Beam-level tensors get dim(0) = target_count * beam_size,
+    // slot-level (memory*) tensors get dim(0) = target_count.
+    // Skips cache_lengths, accumulated_attention, and _retain_memory markers.
+    void resize_batch_state(layers::DecoderState& batch_state,
+                            dim_t target_count) const;
+
+    // Copy all tensor rows from src_slot position to dst_slot position
+    // within batch_state (for defragmentation).
+    void copy_slot_data(layers::DecoderState& batch_state,
+                        size_t src_slot, size_t dst_slot) const;
+
+    // Compact active slots to positions 0..N-1 by moving data forward.
+    // Returns the new active_count.
+    size_t defragment_slots(std::vector<SlotState>& slots,
+                            layers::DecoderState& batch_state) const;
   };
 
 }
