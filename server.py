@@ -6,7 +6,8 @@ Usage:
 
 Environment variables:
     WHISPER_MODEL       Path to CTranslate2 whisper model directory (required)
-    MAX_SLOTS           Max concurrent decode slots (default: 4)
+    MAX_SLOTS           Max concurrent decode slots per worker (default: 4)
+    NUM_WORKERS         Number of parallel batcher workers (default: 1)
     DEVICE              "cpu" or "cuda" (default: "cpu")
     DEVICE_INDEX        GPU index (default: 0)
     COMPUTE_TYPE        e.g. "default", "float16", "int8" (default: "default")
@@ -20,6 +21,7 @@ Environment variables:
 import asyncio
 import faulthandler
 import io
+import itertools
 import json
 import logging
 import os
@@ -71,7 +73,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = os.environ.get("WHISPER_MODEL", "")
-MAX_SLOTS = int(os.environ.get("MAX_SLOTS", "4"))
+SLOTS_PER_WORKER = int(os.environ.get("MAX_SLOTS", "4"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "1"))
 DEVICE = os.environ.get("DEVICE", "cpu")
 DEVICE_INDEX = int(os.environ.get("DEVICE_INDEX", "0"))
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "default")
@@ -119,9 +122,16 @@ def get_audio_duration(raw: bytes) -> float:
 # Global state filled at startup
 # ---------------------------------------------------------------------------
 
-batcher: WhisperContinuousBatcher = None  # type: ignore[assignment]
+batchers: list[WhisperContinuousBatcher] = []
 feature_extractor: FeatureExtractor = None  # type: ignore[assignment]
 hf_tokenizer: tokenizers.Tokenizer = None  # type: ignore[assignment]
+
+# Round-robin batcher selector (thread-safe: itertools.cycle + next() is GIL-protected).
+_batcher_cycle = itertools.cycle(range(0))  # re-initialised in lifespan
+
+
+def get_batcher() -> WhisperContinuousBatcher:
+    return batchers[next(_batcher_cycle)]
 
 
 def _load_feature_extractor(model_path: str) -> FeatureExtractor:
@@ -161,7 +171,7 @@ def raise_oai_error(message: str, param=None, code: int = 400):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global batcher, feature_extractor, hf_tokenizer
+    global batchers, feature_extractor, hf_tokenizer, _batcher_cycle
 
     if not MODEL_PATH:
         raise RuntimeError("Set WHISPER_MODEL env var to the CTranslate2 model directory")
@@ -173,25 +183,35 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"tokenizer.json not found in {MODEL_PATH}")
     hf_tokenizer = tokenizers.Tokenizer.from_file(tok_path)
 
-    batcher = WhisperContinuousBatcher(
-        model_path=MODEL_PATH,
-        max_slots=MAX_SLOTS,
-        device=DEVICE,
-        device_index=DEVICE_INDEX,
-        compute_type=COMPUTE_TYPE,
-        beam_size=BEAM_SIZE,
-        patience=1.0,
-        length_penalty=1.0,
-        max_length=448,
-        suppress_blank=True,
-        suppress_tokens=[-1],
-        max_initial_timestamp_index=50,
+    for i in range(NUM_WORKERS):
+        b = WhisperContinuousBatcher(
+            model_path=MODEL_PATH,
+            max_slots=SLOTS_PER_WORKER,
+            device=DEVICE,
+            device_index=DEVICE_INDEX,
+            compute_type=COMPUTE_TYPE,
+            beam_size=BEAM_SIZE,
+            patience=1.0,
+            length_penalty=1.0,
+            max_length=448,
+            suppress_blank=True,
+            suppress_tokens=[-1],
+            max_initial_timestamp_index=50,
+        )
+        b.start()
+        batchers.append(b)
+
+    _batcher_cycle = itertools.cycle(range(NUM_WORKERS))
+
+    logger.info(
+        "Started %d worker(s) with %d slots each (%d total slots)",
+        NUM_WORKERS, SLOTS_PER_WORKER, NUM_WORKERS * SLOTS_PER_WORKER,
     )
-    batcher.start()
 
     yield
 
-    batcher.stop()
+    for b in batchers:
+        b.stop()
 
 
 app = FastAPI(title="Whisper Continuous Batching", lifespan=lifespan)
@@ -231,7 +251,7 @@ async def validation_to_oai(request, exc):
 
 @app.get("/health")
 async def health_check():
-    if batcher is None:
+    if not batchers:
         return Response(
             content="Not ready", status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
@@ -283,11 +303,15 @@ async def transcribe(
         # Resolve hotwords
         hotwords = HOTWORDS if (enable_default_hotwords and HOTWORDS) else None
 
+        # Pick a batcher via round-robin.
+        assigned_batcher = get_batcher()
+
         try:
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
                     _process_request,
+                    assigned_batcher,
                     audio_bytes,
                     resolved_language,
                     bool(detect_language),
@@ -332,6 +356,7 @@ async def transcribe(
 
 
 def _process_request(
+    batcher: WhisperContinuousBatcher,
     audio_bytes: bytes,
     language: Optional[str],
     detect_language: bool,

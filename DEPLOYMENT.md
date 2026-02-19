@@ -118,7 +118,8 @@ ct2-transformers-converter --model openai/whisper-large-v3 --output_dir models/w
 export WHISPER_MODEL=/path/to/models/whisper-large-v3
 
 # Optional (shown with defaults)
-export MAX_SLOTS=4              # concurrent decode slots
+export MAX_SLOTS=4              # concurrent decode slots PER worker
+export NUM_WORKERS=1            # number of parallel batcher workers (2 = 2×4=8 total slots)
 export DEVICE=cuda              # "cpu" or "cuda"
 export DEVICE_INDEX=0           # GPU index
 export COMPUTE_TYPE=float16     # "default", "float16", "int8", etc.
@@ -244,10 +245,12 @@ CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "80
 
 | Parameter | Effect |
 |-----------|--------|
-| `MAX_SLOTS=4` | More slots = higher throughput but more memory. Start with 4, increase if GPU memory allows. |
+| `MAX_SLOTS=4` | Decode slots per worker. More slots = higher throughput but more GPU memory. |
+| `NUM_WORKERS=2` | Parallel batcher workers on separate CUDA streams. Use `NUM_WORKERS=2` (8 total slots) for 130 concurrent users on H100. |
 | `BEAM_SIZE=1` | Greedy decoding — fastest. `BEAM_SIZE=2-5` improves quality at cost of speed. |
 | `COMPUTE_TYPE=float16` | Half precision on GPU — fastest. Use `int8` for lower memory. |
 | `COMPUTE_TYPE=int8` | Quantized — lowest memory, slightly lower quality. |
+| `CT2_CPU_BEAM_FALLBACK=1` | Disable GPU beam pipeline (use CPU beam search). Only for debugging. |
 
 ## Files
 
