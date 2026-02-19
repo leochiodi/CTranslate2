@@ -148,23 +148,115 @@ The plan had 7 changes. Here is the status of each:
 
 ---
 
-## BUG FIXED: GPU pipeline produces different text than CPU fallback
+## Bug 4: GPU pipeline wrong text (timestamp suppression) — FIXED
 
-**Status**: FIXED.
+**Root cause**: Phase B (CPU bookkeeping updating `slot.beam_tokens`) ran AFTER the Whisper
+logits processor. The logits processor reads `slot.beam_tokens[b]` for timestamp/token
+suppression rules, so it saw stale token history (off by one step), suppressing the wrong tokens.
 
-**Root cause**: The GPU pipeline's Phase B (CPU bookkeeping that updates `slot.beam_tokens`)
-was executing AFTER the Whisper logits processor. The logits processor reads `slot.beam_tokens[b]`
-to determine timestamp/token suppression rules. Because Phase B ran after logits processing,
-the processor saw stale token history (off by one step), causing it to suppress the wrong tokens
-(e.g., suppressing word tokens while allowing timestamps when it should have been the reverse).
+**Fix**: Moved Phase B from inside the GPU pipeline branch to before the logits processor call
+(line ~1190 in continuous_decoding.cc). Single-slot transcription now matches CPU fallback.
 
-**Fix**: Moved Phase B from inside the GPU pipeline branch to before the logits processor call.
-This ensures `slot.beam_tokens` is fully up-to-date before suppression decisions are made.
-The decoder forward pass (Phase A) doesn't depend on Phase B's output, so this reordering
-is safe and doesn't affect the pipelining of GPU work.
+---
 
-**Verification**: GPU and CPU paths now produce nearly identical text (minor fp16 rounding
-differences in beam scores can cause slightly different beam selections, but output is coherent).
+## Bug 5: GPU pipeline empty/truncated results with multiple concurrent slots — FIXED
+
+**Root cause**: Slot index mismatch between Phase B staging buffers and current slot positions.
+`defragment_slots()` in Phase D shifted slot indices after D2H was launched in Phase C.
+Phase B (next iteration) read staging buffers using post-defrag indices but buffers had
+pre-defrag data. Additionally, `pending_beam_active_count` didn't account for defrag
+removing slots then fill adding new ones back to the same count.
+
+**Fix (Option A — staging index mapping)**:
+1. Added `pending_staging_map` vector mapping post-defrag slot position → pre-defrag
+   staging buffer index. Built before `defragment_slots()` by recording active slot
+   positions in order.
+2. Phase B and final sync use `pending_staging_map[s]` instead of `s` for all staging
+   buffer reads (`staging_*[stg]` / `staging_*[stg_offset + b]`).
+3. `pending_beam_active_count` updated to post-defrag count (before fill) so Phase B
+   won't iterate into newly-filled slots that have no staging data.
+4. Map reset to identity at each D2H launch (Phase C), since staging indices match
+   current positions at that point.
+
+**Verified**: 19 x 30s chunks, max_slots=4, beam_size=5. GPU pipeline and CPU fallback
+produce equivalent results (17-18 OK, 1-2 empty from VAD/server issues, not beam search).
+
+---
+
+## ACTIVE BUG 6: GPU beam kernel early termination — n_finished accumulates too fast
+
+**Status**: Root-caused, NOT YET FIXED. Affects single-slot too (no defrag involved).
+
+**Symptom**: GPU pipeline returns only 1-2 words for a 30s audio chunk. CPU fallback
+(`CT2_CPU_BEAM_FALLBACK=1`) returns full correct transcription. Tested on H100 with
+whisper-large-v3, beam_size=5, single 30s chunk via server.
+
+**H100 debug logs** (single slot, `CT2_DEBUG_DEFRAG=1`):
+```
+[D2H] active=1 slots=[0:r0:s3]
+[PHASE_B] sync_active=1 cur_active=1 map=[0->0]
+[PHASE_B] s=0 stg=0 req=0 step=3 slot_finished=0 n_eos=0 n_finished=0 bf=[0,0,0,0,0]
+[D2H] active=1 slots=[0:r0:s4]
+[PHASE_B] sync_active=1 cur_active=1 map=[0->0]
+[PHASE_B] s=0 stg=0 req=0 step=4 slot_finished=0 n_eos=1 n_finished=1 eos_beams=[0] bf=[0,0,0,0,0]
+[D2H] active=1 slots=[0:r0:s5]
+[PHASE_B] sync_active=1 cur_active=1 map=[0->0]
+[PHASE_B] s=0 stg=0 req=0 step=5 slot_finished=0 n_eos=0 n_finished=1 bf=[0,0,0,0,0]
+[D2H] active=1 slots=[0:r0:s6]
+[PHASE_B] sync_active=1 cur_active=1 map=[0->0]
+[PHASE_B] s=0 stg=0 req=0 step=6 slot_finished=0 n_eos=1 n_finished=2 eos_beams=[1] bf=[0,0,0,0,0]
+[D2H] active=1 slots=[0:r0:s7]
+[PHASE_B] sync_active=1 cur_active=1 map=[0->0]
+[PHASE_B] s=0 stg=0 req=0 step=7 slot_finished=1 n_eos=3 n_finished=5 eos_beams=[2,1,0] bf=[0,0,0,0,1]
+[DECODE PROFILE] steps=5 total=95.4ms per_step=19.08ms GPU%=36.4%
+```
+
+**Key observations**:
+1. `n_finished` accumulates across steps: 0 → 1 → 1 → 2 → 5 (hits max_candidates=5)
+2. `bf=[0,0,0,0,0]` — beams that produce EOS are **never marked finished**
+3. At step 7, three beams (2,1,0) hit EOS simultaneously, pushing n_finished from 2 to 5
+4. Total only 5 decode steps, ~2 generated tokens before termination
+5. CPU fallback produces full transcription for the same audio
+
+**Root cause analysis**:
+
+The GPU beam_select kernel (`src/cuda/beam_select.cu`) accumulates `n_finished` via
+`num_finished_in[slot]` which persists across steps. Each step, if any beam's best
+candidate is EOS, `n_finished++`. But the beam is NOT marked as finished in
+`beam_finished_out` because:
+
+1. When a beam hits EOS, the kernel does `continue` (doesn't fill an output position)
+2. There are enough non-EOS candidates (num_candidates = 2*beam_size = 10) to fill
+   all beam_size=5 output positions even after skipping the EOS
+3. So all output positions get `beam_finished_out = 0`
+4. Next step, the same beam can hit EOS again → increments n_finished again
+
+The CPU fallback path has the same accumulation logic (`slot.num_finished_beams++`),
+but it produces much longer output. The difference is likely in the **logits** being
+fed to the kernel — the Whisper logits processor uses `slot.beam_tokens` for
+timestamp/token suppression, and if the token history differs between GPU and CPU
+paths, different tokens get suppressed, changing EOS frequency.
+
+**Possible explanations for the logits difference**:
+- The GPU pipeline's Phase B updates `slot.beam_tokens` one step behind (pipelined),
+  which was supposed to be fixed by Bug 4, but there may still be an off-by-one
+- The `add_depth_broadcast` that adds beam_scores to logits in fp16 may introduce
+  precision differences vs the CPU path
+- The speculative step increment in Phase D may cause `cache_lengths` to be wrong,
+  feeding the decoder wrong positional info
+
+**Investigation needed**:
+1. Add debug logging of `beam_tokens[0]` (best beam's token history) at each step
+   to compare GPU vs CPU path token-by-token
+2. Check if the logits processor sees the same `beam_tokens` in both paths
+3. Compare the actual logits values for the EOS token between GPU and CPU paths
+
+**Debug env var**: `CT2_DEBUG_DEFRAG=1` enables Phase B / D2H / defrag logging to stderr.
+Needs more fields added (beam_tokens) — uncommitted edit exists locally.
+
+**Files involved**:
+- `src/cuda/beam_select.cu` — kernel accumulates n_finished, may need logic change
+- `src/continuous_decoding.cc` — Phase B beam_tokens update, logits processor interaction
 
 ---
 
@@ -194,7 +286,9 @@ differences in beam scores can cause slightly different beam selections, but out
 2. ~~Re-enable C5 (gather skip)~~ — DONE
 3. ~~Verify C3 (CUDA streams per batcher)~~ — DONE
 4. ~~FIX GPU pipeline text divergence~~ — FIXED (Phase B moved before logits processing)
-5. Test NUM_WORKERS=2+ with concurrent load
+5. ~~FIX GPU pipeline empty/truncated results with concurrent slots~~ — FIXED (staging index mapping)
+6. **FIX GPU beam kernel early termination** — Bug 6, active, see above
+7. Test NUM_WORKERS=2+ with concurrent load
 6. Load test on H100 with 130 concurrent users
 7. Remove debug fprintf + `[DECODE PROFILE]` once tuned on target hardware
 
@@ -216,6 +310,7 @@ differences in beam scores can cause slightly different beam selections, but out
 | Flag | Effect |
 |------|--------|
 | `CT2_CPU_BEAM_FALLBACK=1` | Force CPU fallback beam path (for A/B testing) |
+| `CT2_DEBUG_DEFRAG=1` | Enable Phase B / D2H / defrag debug logging to stderr |
 | `CT2_NO_ATTN_CAPTURE=1` | Disable attention capture in whisper decoder |
 | `NUM_WORKERS` | Number of batcher instances (default: 1) |
 | `MAX_SLOTS` | Slots per worker (default: 4) |

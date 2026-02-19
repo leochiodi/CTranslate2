@@ -1270,6 +1270,15 @@ namespace ctranslate2 {
             if (!slot.beam_tokens.empty() && !slot.beam_tokens[0].empty())
               slot.generated_tokens = slot.beam_tokens[0];
 
+            if (debug_defrag && !slot.beam_tokens.empty() && !slot.beam_tokens[0].empty()) {
+              fprintf(stderr, "[PHASE_B] tokens[0] len=%zu last=", slot.beam_tokens[0].size());
+              size_t n = slot.beam_tokens[0].size();
+              size_t start = n > 5 ? n - 5 : 0;
+              for (size_t i = start; i < n; ++i)
+                fprintf(stderr, "%s%zu", i>start?",":"", slot.beam_tokens[0][i]);
+              fprintf(stderr, "\n");
+            }
+
             // Check if slot is fully finished.
             if (staging_slot_finished[stg]) {
               if (slot.step >= _max_length) {
