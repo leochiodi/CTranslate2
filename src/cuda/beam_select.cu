@@ -73,6 +73,9 @@ __global__ void beam_select_kernel(
             score / powf(hyp_len, length_penalty);
         n_eos++;
       }
+      // Mark this source beam as finished so it can't produce more EOS
+      // candidates (within this step or, via beam_finished_out, in future steps).
+      local_finished[beam_id] = 1;
       n_finished++;
       if (n_finished >= max_candidates) {
         while (filled < beam_size) {

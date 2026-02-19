@@ -1218,9 +1218,21 @@ namespace ctranslate2 {
             const dim_t stg_offset = static_cast<dim_t>(stg) * _beam_size;
 
             if (debug_defrag) {
-              fprintf(stderr, "[PHASE_B] s=%zu stg=%zu req=%lu step=%zu slot_finished=%d n_eos=%d\n",
+              fprintf(stderr, "[PHASE_B] s=%zu stg=%zu req=%lu step=%zu slot_finished=%d n_eos=%d n_finished=%d",
                       s, stg, slot.request_id, slot.step,
-                      staging_slot_finished[stg], staging_num_eos[stg]);
+                      staging_slot_finished[stg], staging_num_eos[stg],
+                      staging_num_finished[stg]);
+              // Log EOS beam IDs and beam_finished state
+              if (staging_num_eos[stg] > 0) {
+                fprintf(stderr, " eos_beams=[");
+                for (int32_t e = 0; e < staging_num_eos[stg]; ++e)
+                  fprintf(stderr, "%s%d", e?",":"", staging_eos_beam_ids[stg_offset + e]);
+                fprintf(stderr, "]");
+              }
+              fprintf(stderr, " bf=[");
+              for (dim_t b = 0; b < _beam_size; ++b)
+                fprintf(stderr, "%s%d", b?",":"", staging_beam_finished[stg_offset + b]);
+              fprintf(stderr, "]\n");
             }
 
             // Collect EOS hypotheses from previous step.
