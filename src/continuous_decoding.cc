@@ -1478,6 +1478,19 @@ namespace ctranslate2 {
           const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
           const dim_t s_dim = static_cast<dim_t>(s);
 
+          // Debug: log EOS positions in full TopK and n_finished before selection.
+          if (debug_defrag && s == active_slot_indices[0]) {
+            fprintf(stderr, "[CPU_SEL] step=%d n_finished_before=%zu eos_at=",
+                    (int)slot.step, slot.num_finished_beams);
+            for (dim_t k = 0; k < num_candidates; ++k) {
+              int32_t fid = topk_ids.at<int32_t>({s_dim, k});
+              size_t wid = fid % vocab_size;
+              if (is_eos(wid, _end_ids))
+                fprintf(stderr, "k%d(b%d) ", (int)k, (int)(fid / vocab_size));
+            }
+            fprintf(stderr, "\n");
+          }
+
           std::vector<dim_t> new_beam_from(_beam_size, -1);
           std::vector<size_t> new_beam_token(_beam_size, 0);
           std::vector<float> new_beam_score(_beam_size, -1e9f);
@@ -1701,7 +1714,7 @@ namespace ctranslate2 {
         auto& topk_scores_step = topk_scores_f32;
         auto& topk_ids = gpu_topk_ids;
 
-        // Debug: dump TopK results for first slot.
+        // Debug: dump TopK results and EOS positions for first slot.
         if (debug_defrag && active_count > 0) {
           StorageView ids_cpu = topk_ids.to(Device::CPU);
           StorageView scores_cpu = topk_scores_step.to(Device::CPU);
@@ -1710,6 +1723,13 @@ namespace ctranslate2 {
             int32_t flat = ids_cpu.at<int32_t>({0, k});
             float sc = scores_cpu.at<float>({0, k});
             fprintf(stderr, "id=%d(b%d,w%d,sc=%.2f) ", flat, (int)(flat/vocab_size), (int)(flat%vocab_size), sc);
+          }
+          fprintf(stderr, "eos_at=");
+          for (dim_t k = 0; k < num_candidates; ++k) {
+            int32_t flat = ids_cpu.at<int32_t>({0, k});
+            size_t wid = flat % vocab_size;
+            if (is_eos(wid, _end_ids))
+              fprintf(stderr, "k%d(b%d) ", (int)k, (int)(flat/vocab_size));
           }
           fprintf(stderr, "\n");
         }
