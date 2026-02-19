@@ -181,11 +181,12 @@ removing slots then fill adding new ones back to the same count.
 **Verified**: 19 x 30s chunks, max_slots=4, beam_size=5. GPU pipeline and CPU fallback
 produce equivalent results (17-18 OK, 1-2 empty from VAD/server issues, not beam search).
 
+
 ---
 
-## ACTIVE BUG 6: GPU beam kernel early termination — n_finished accumulates too fast
+## Bug 6: GPU beam kernel early termination — n_finished accumulates too fast — FIXED
 
-**Status**: Root-caused, NOT YET FIXED. Affects single-slot too (no defrag involved).
+**Status**: FIXED. Affects single-slot too (no defrag involved).
 
 **Symptom**: GPU pipeline returns only 1-2 words for a 30s audio chunk. CPU fallback
 (`CT2_CPU_BEAM_FALLBACK=1`) returns full correct transcription. Tested on H100 with
