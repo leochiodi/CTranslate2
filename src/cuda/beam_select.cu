@@ -58,13 +58,17 @@ __global__ void beam_select_kernel(
     const int beam_id = flat_id / vocab_size;
     const int word_id = flat_id % vocab_size;
 
-    if (local_finished[beam_id])
-      continue;
-
     bool is_eos = false;
     for (int e = 0; e < num_end_ids; ++e) {
       if (word_id == end_ids[e]) { is_eos = true; break; }
     }
+
+    // Only skip if this beam already produced EOS this step (prevent duplicate
+    // EOS from same beam). Non-EOS candidates from a beam that hit EOS are
+    // still valid — matches CPU fallback behavior where beam_finished is NOT
+    // set on EOS, allowing the beam to continue with other tokens.
+    if (is_eos && local_finished[beam_id])
+      continue;
 
     if (is_eos) {
       if (n_eos < beam_size) {
@@ -73,8 +77,6 @@ __global__ void beam_select_kernel(
             score / powf(hyp_len, length_penalty);
         n_eos++;
       }
-      // Mark this source beam as finished so it can't produce more EOS
-      // candidates within this step.
       local_finished[beam_id] = 1;
       n_finished++;
       if (n_finished >= max_candidates) {
