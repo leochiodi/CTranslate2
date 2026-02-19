@@ -772,6 +772,7 @@ namespace ctranslate2 {
     // "_bs_*" → beam-level (dim0 = total_batch), "memory_bs_*" → slot-level (dim0 = max_slots).
     bool use_gpu_beam_pipeline = (_beam_size > 1 && device == Device::CUDA
                                    && std::getenv("CT2_CPU_BEAM_FALLBACK") == nullptr);
+    const bool debug_defrag = (std::getenv("CT2_DEBUG_DEFRAG") != nullptr);
 #ifdef CT2_WITH_CUDA
     cudaEvent_t d2h_event = nullptr;
     bool pending_beam_sync = false;
@@ -1198,6 +1199,13 @@ namespace ctranslate2 {
           // Use the active_count from when the D2H was launched, NOT the current
           // active_count which may include newly-filled slots with no staging data.
           const size_t sync_active_count = pending_beam_active_count;
+          if (debug_defrag) {
+            fprintf(stderr, "[PHASE_B] sync_active=%zu cur_active=%zu map=[",
+                    sync_active_count, active_count);
+            for (size_t i = 0; i < sync_active_count; ++i)
+              fprintf(stderr, "%s%zu→%zu", i?",":"", i, pending_staging_map[i]);
+            fprintf(stderr, "]\n");
+          }
           for (size_t s = 0; s < sync_active_count; ++s) {
             auto& slot = slots[s];
             if (!slot.active)
@@ -1208,6 +1216,12 @@ namespace ctranslate2 {
             // between Phase C (D2H launch) and this Phase B (D2H consume).
             const size_t stg = pending_staging_map[s];
             const dim_t stg_offset = static_cast<dim_t>(stg) * _beam_size;
+
+            if (debug_defrag) {
+              fprintf(stderr, "[PHASE_B] s=%zu stg=%zu req=%lu step=%zu slot_finished=%d n_eos=%d\n",
+                      s, stg, slot.request_id, slot.step,
+                      staging_slot_finished[stg], staging_num_eos[stg]);
+            }
 
             // Collect EOS hypotheses from previous step.
             const int32_t n_eos = staging_num_eos[stg];
@@ -1785,6 +1799,12 @@ namespace ctranslate2 {
         // Reset staging map to identity — staging indices match current slot positions.
         // Defrag (below) will update this if it moves slots.
         std::iota(pending_staging_map.begin(), pending_staging_map.end(), 0);
+        if (debug_defrag) {
+          fprintf(stderr, "[D2H] active=%zu slots=[", active_count);
+          for (size_t i = 0; i < active_count; ++i)
+            fprintf(stderr, "%s%zu:r%lu:s%zu", i?",":"", i, slots[i].request_id, slots[i].step);
+          fprintf(stderr, "]\n");
+        }
 #endif
       }
 
