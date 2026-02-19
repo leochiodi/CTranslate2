@@ -460,6 +460,11 @@ def _process_request(
 
     for i, req_id in enumerate(req_ids):
         result = batcher.get_result(req_id)
+        if not result.sequences_ids:
+            seg = segments[i] if i < len(segments) else None
+            dur = f"{seg['end']-seg['start']:.2f}s" if seg else "?"
+            logger.warning("Segment %d (%s): empty result (no hypotheses), skipping", i, dur)
+            continue
         tokens = result.sequences_ids[0]
         total_tokens += len(tokens)
         text = tokenizer.decode(tokens)
