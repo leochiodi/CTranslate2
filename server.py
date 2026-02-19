@@ -414,36 +414,75 @@ def _process_request(
         hw_token_ids = hf_tokenizer.encode(" " + hotwords).ids
         prompt = [tokenizer.sot_prev] + hw_token_ids + prompt
 
-    # 6. Submit each VAD segment as a separate batcher request.
-    #    This preserves per-segment timing for the response.
-    req_ids = []
-    segment_times = []  # (start_sec, end_sec) per segment
-    segment_num_frames = []  # num_frames_raw per segment
+    # 6. Pack VAD speech segments into ~30s chunks (Whisper's max window) with
+    #    100ms silence gaps between concatenated segments. This maximises GPU
+    #    utilisation by sending fewer, fuller requests to the batcher.
+    MAX_CHUNK_SAMPLES = int(30.0 * sampling_rate)  # 30s in samples
+    SILENCE_GAP_SAMPLES = int(0.1 * sampling_rate)  # 100ms silence between segments
+    silence_gap = np.zeros(SILENCE_GAP_SAMPLES, dtype=waveform.dtype)
 
-    t_mel_start = time.time()
-    for i, chunk_info in enumerate(speech_chunks):
+    # Group VAD segments into packed chunks.
+    packed_chunks = []  # list of (audio_array, [(orig_start_sec, orig_end_sec), ...])
+    current_audio_parts = []
+    current_length = 0
+    current_times = []
+
+    for chunk_info in speech_chunks:
         start_sample = chunk_info["start"]
         end_sample = chunk_info["end"]
-        chunk = waveform[start_sample:end_sample]
+        seg_samples = end_sample - start_sample
 
-        mel = feature_extractor(chunk)
+        # Would adding this segment (+ gap) exceed 30s? If so, flush current chunk.
+        gap_needed = SILENCE_GAP_SAMPLES if current_audio_parts else 0
+        if current_length > 0 and current_length + gap_needed + seg_samples > MAX_CHUNK_SAMPLES:
+            packed_chunks.append((
+                np.concatenate(current_audio_parts),
+                current_times[:],
+            ))
+            current_audio_parts = []
+            current_length = 0
+            current_times = []
+            gap_needed = 0
+
+        if current_audio_parts:
+            current_audio_parts.append(silence_gap)
+            current_length += SILENCE_GAP_SAMPLES
+
+        current_audio_parts.append(waveform[start_sample:end_sample])
+        current_length += seg_samples
+        current_times.append((start_sample / sampling_rate, end_sample / sampling_rate))
+
+    if current_audio_parts:
+        packed_chunks.append((
+            np.concatenate(current_audio_parts),
+            current_times[:],
+        ))
+
+    # Submit packed chunks to the batcher.
+    req_ids = []
+    segment_times = []  # (start_sec, end_sec) per packed chunk (from first/last VAD seg)
+    segment_num_frames = []  # num_frames_raw per packed chunk
+
+    t_mel_start = time.time()
+    for packed_audio, orig_times in packed_chunks:
+        mel = feature_extractor(packed_audio)
         num_frames_raw = mel.shape[-1]
         mel = pad_or_trim(mel, length=feature_extractor.nb_max_frames)
         features = StorageView.from_array(mel[np.newaxis].astype(np.float32))
 
         segment_num_frames.append(num_frames_raw)
         req_ids.append(batcher.submit(features, prompt))
-        segment_times.append(
-            (start_sample / sampling_rate, end_sample / sampling_rate)
-        )
+        # Use the original time span from first to last VAD segment in this chunk.
+        segment_times.append((orig_times[0][0], orig_times[-1][1]))
 
     t_pre_done = time.time()
     if PROMETHEUS_AVAILABLE:
         STT_PREPROCESS_TIME.observe(t_pre_done - t_pre)
 
     logger.info(
-        "Submitted %d VAD segments (%.1fs speech in %.1fs audio)",
+        "Submitted %d packed chunks from %d VAD segments (%.1fs speech in %.1fs audio)",
         len(req_ids),
+        len(speech_chunks),
         sum(e - s for s, e in segment_times),
         len(waveform) / sampling_rate,
     )
