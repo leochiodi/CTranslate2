@@ -775,6 +775,11 @@ namespace ctranslate2 {
 #ifdef CT2_WITH_CUDA
     cudaEvent_t d2h_event = nullptr;
     bool pending_beam_sync = false;
+    size_t pending_beam_active_count = 0;  // active_count when D2H was launched
+    // Mapping from post-defrag slot index to pre-defrag staging buffer index.
+    // Needed because defragment_slots() shifts slot positions after D2H was launched.
+    std::vector<size_t> pending_staging_map(_max_slots);
+    std::iota(pending_staging_map.begin(), pending_staging_map.end(), 0);
 
     // Pinned CPU staging buffers for async D2H.
     int32_t* staging_next_tokens = nullptr;
@@ -1190,17 +1195,25 @@ namespace ctranslate2 {
       if (use_gpu_beam_pipeline && pending_beam_sync) {
           cudaEventSynchronize(d2h_event);
 
-          for (size_t s = 0; s < active_count; ++s) {
+          // Use the active_count from when the D2H was launched, NOT the current
+          // active_count which may include newly-filled slots with no staging data.
+          const size_t sync_active_count = pending_beam_active_count;
+          for (size_t s = 0; s < sync_active_count; ++s) {
             auto& slot = slots[s];
             if (!slot.active)
               continue;
-            const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
+
+            // Use pending_staging_map to translate post-defrag slot index to
+            // pre-defrag staging buffer index. Defrag may have shifted slots
+            // between Phase C (D2H launch) and this Phase B (D2H consume).
+            const size_t stg = pending_staging_map[s];
+            const dim_t stg_offset = static_cast<dim_t>(stg) * _beam_size;
 
             // Collect EOS hypotheses from previous step.
-            const int32_t n_eos = staging_num_eos[s];
+            const int32_t n_eos = staging_num_eos[stg];
             for (int32_t e = 0; e < n_eos; ++e) {
-              const int32_t eos_beam = staging_eos_beam_ids[s_offset + e];
-              const float eos_score = staging_eos_scores[s_offset + e];
+              const int32_t eos_beam = staging_eos_beam_ids[stg_offset + e];
+              const float eos_score = staging_eos_scores[stg_offset + e];
               std::vector<size_t> hyp_tokens = slot.beam_tokens[eos_beam];
               slot.finished_hypotheses.push_back(
                 SlotState::Hypothesis{std::move(hyp_tokens), eos_score});
@@ -1209,11 +1222,11 @@ namespace ctranslate2 {
             // Reorder beam_tokens according to gather_indices and append new tokens.
             std::vector<std::vector<size_t>> updated_beam_tokens(_beam_size);
             for (dim_t b = 0; b < _beam_size; ++b) {
-              const int32_t src_beam = staging_gather_indices[s_offset + b] - s_offset;
+              const int32_t src_beam = staging_gather_indices[stg_offset + b] - stg_offset;
               if (src_beam >= 0 && src_beam < _beam_size) {
                 updated_beam_tokens[b] = slot.beam_tokens[src_beam];
                 updated_beam_tokens[b].push_back(
-                  static_cast<size_t>(staging_next_tokens[s_offset + b]));
+                  static_cast<size_t>(staging_next_tokens[stg_offset + b]));
               }
             }
             slot.beam_tokens = std::move(updated_beam_tokens);
@@ -1222,17 +1235,17 @@ namespace ctranslate2 {
             slot.beam_scores.resize(_beam_size);
             slot.beam_finished.resize(_beam_size);
             for (dim_t b = 0; b < _beam_size; ++b) {
-              slot.beam_scores[b] = staging_beam_scores[s_offset + b];
-              slot.beam_finished[b] = staging_beam_finished[s_offset + b] != 0;
+              slot.beam_scores[b] = staging_beam_scores[stg_offset + b];
+              slot.beam_finished[b] = staging_beam_finished[stg_offset + b] != 0;
             }
-            slot.num_finished_beams = static_cast<size_t>(staging_num_finished[s]);
+            slot.num_finished_beams = static_cast<size_t>(staging_num_finished[stg]);
             slot.step++;  // Confirm speculative step++ from previous Phase D.
 
             if (!slot.beam_tokens.empty() && !slot.beam_tokens[0].empty())
               slot.generated_tokens = slot.beam_tokens[0];
 
             // Check if slot is fully finished.
-            if (staging_slot_finished[s]) {
+            if (staging_slot_finished[stg]) {
               if (slot.step >= _max_length) {
                 for (dim_t b = 0; b < _beam_size; ++b) {
                   if (!slot.beam_finished[b]
@@ -1263,6 +1276,7 @@ namespace ctranslate2 {
                 const auto& accum = batch_state["accumulated_attention"];
                 if (accum) {
                   cr.attention_weights = StorageView(accum.dtype(), accum.device());
+                  const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
                   StorageView slot_idx({1}, int32_t(s_offset), device);
                   ops::Gather()(accum, slot_idx, cr.attention_weights);
                   cr.attention_weights.squeeze(0);
@@ -1288,8 +1302,8 @@ namespace ctranslate2 {
 
           // Set flag for Phase C: were all slots identity-gather in the previous step?
           bool all_id = true;
-          for (size_t s = 0; s < active_count && all_id; ++s)
-            if (staging_needs_gather[s] != 0)
+          for (size_t s = 0; s < sync_active_count && all_id; ++s)
+            if (staging_needs_gather[pending_staging_map[s]] != 0)
               all_id = false;
           prev_step_all_identity = all_id;
 
@@ -1767,6 +1781,10 @@ namespace ctranslate2 {
 
         cudaEventRecord(d2h_event);
         pending_beam_sync = true;
+        pending_beam_active_count = active_count;
+        // Reset staging map to identity — staging indices match current slot positions.
+        // Defrag (below) will update this if it moves slots.
+        std::iota(pending_staging_map.begin(), pending_staging_map.end(), 0);
 #endif
       }
 
@@ -1783,6 +1801,23 @@ namespace ctranslate2 {
       // --- Defragment: compact active slots to positions 0..N-1 ---
       // This ensures the contiguity invariant for the next iteration.
       if (!finished_slots.empty()) {
+#ifdef CT2_WITH_CUDA
+        // Build mapping from post-defrag position to pre-defrag position.
+        // defragment_slots compacts active slots preserving order, so the
+        // k-th active slot (in pre-defrag order) ends up at position k.
+        if (use_gpu_beam_pipeline && pending_beam_sync) {
+          size_t w = 0;
+          for (size_t r = 0; r < _max_slots; ++r) {
+            if (slots[r].active) {
+              pending_staging_map[w] = r;  // new position w had staging data at old position r
+              ++w;
+            }
+          }
+          // Update pending_beam_active_count to post-defrag count so Phase B
+          // won't iterate into newly-filled slots that have no staging data.
+          pending_beam_active_count = w;
+        }
+#endif
         active_count = defragment_slots(slots, batch_state);
       }
 
@@ -1957,17 +1992,19 @@ namespace ctranslate2 {
       cudaEventSynchronize(d2h_event);
 
       // Final CPU bookkeeping for the last step.
-      for (size_t s = 0; s < _max_slots; ++s) {
+      // Only iterate slots that had staging data when the D2H was launched.
+      for (size_t s = 0; s < pending_beam_active_count; ++s) {
         auto& slot = slots[s];
         if (!slot.active)
           continue;
-        const dim_t s_offset = static_cast<dim_t>(s) * _beam_size;
+        const size_t stg = pending_staging_map[s];
+        const dim_t stg_offset = static_cast<dim_t>(stg) * _beam_size;
 
         // Collect EOS hypotheses.
-        const int32_t n_eos = staging_num_eos[s];
+        const int32_t n_eos = staging_num_eos[stg];
         for (int32_t e = 0; e < n_eos; ++e) {
-          const int32_t eos_beam = staging_eos_beam_ids[s_offset + e];
-          const float eos_score = staging_eos_scores[s_offset + e];
+          const int32_t eos_beam = staging_eos_beam_ids[stg_offset + e];
+          const float eos_score = staging_eos_scores[stg_offset + e];
           std::vector<size_t> hyp_tokens = slot.beam_tokens[eos_beam];
           slot.finished_hypotheses.push_back(
             SlotState::Hypothesis{std::move(hyp_tokens), eos_score});
@@ -1976,27 +2013,27 @@ namespace ctranslate2 {
         // Reorder beam_tokens and append new tokens.
         std::vector<std::vector<size_t>> updated_beam_tokens(_beam_size);
         for (dim_t b = 0; b < _beam_size; ++b) {
-          const int32_t src_beam = staging_gather_indices[s_offset + b] - s_offset;
+          const int32_t src_beam = staging_gather_indices[stg_offset + b] - stg_offset;
           if (src_beam >= 0 && src_beam < _beam_size) {
             updated_beam_tokens[b] = slot.beam_tokens[src_beam];
             updated_beam_tokens[b].push_back(
-              static_cast<size_t>(staging_next_tokens[s_offset + b]));
+              static_cast<size_t>(staging_next_tokens[stg_offset + b]));
           }
         }
         slot.beam_tokens = std::move(updated_beam_tokens);
 
         for (dim_t b = 0; b < _beam_size; ++b) {
-          slot.beam_scores[b] = staging_beam_scores[s_offset + b];
-          slot.beam_finished[b] = staging_beam_finished[s_offset + b] != 0;
+          slot.beam_scores[b] = staging_beam_scores[stg_offset + b];
+          slot.beam_finished[b] = staging_beam_finished[stg_offset + b] != 0;
         }
-        slot.num_finished_beams = static_cast<size_t>(staging_num_finished[s]);
+        slot.num_finished_beams = static_cast<size_t>(staging_num_finished[stg]);
         slot.step++;
 
         if (!slot.beam_tokens.empty() && !slot.beam_tokens[0].empty())
           slot.generated_tokens = slot.beam_tokens[0];
 
         // If slot finished, deliver result.
-        if (staging_slot_finished[s]) {
+        if (staging_slot_finished[stg]) {
           if (slot.step >= _max_length) {
             for (dim_t b = 0; b < _beam_size; ++b) {
               if (!slot.beam_finished[b]
