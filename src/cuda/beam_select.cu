@@ -77,6 +77,17 @@ __global__ void beam_select_kernel(
       // candidates (within this step or, via beam_finished_out, in future steps).
       local_finished[beam_id] = 1;
       n_finished++;
+
+      // CRITICAL: Fill an output position for this finished beam so it stays
+      // marked finished in subsequent steps. Without this, the beam slot gets
+      // filled by a non-EOS candidate with beam_finished_out=0, allowing the
+      // same beam to hit EOS again on future steps and double-count n_finished.
+      gather_indices[s_offset + filled] = s_offset + beam_id;
+      next_tokens[s_offset + filled] = word_id;
+      beam_scores_out[s_offset + filled] = score;
+      beam_finished_out[s_offset + filled] = 1;
+      filled++;
+
       if (n_finished >= max_candidates) {
         while (filled < beam_size) {
           gather_indices[s_offset + filled] = s_offset;
