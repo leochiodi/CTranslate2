@@ -1071,6 +1071,16 @@ namespace ctranslate2 {
 
       }
 
+      // Debug: dump sample_from tokens for first slot's beams before decoder.
+      if (debug_defrag && active_count > 0) {
+        StorageView sf_cpu = active_sample_from_device.to(Device::CPU);
+        fprintf(stderr, "[STEP] step=%d sample_from=[", (int)slots[0].step);
+        for (dim_t b = 0; b < _beam_size && b < sf_cpu.size(); ++b)
+          fprintf(stderr, "%s%d", b?",":"", sf_cpu.at<int32_t>(b));
+        fprintf(stderr, "] step_off=%d gpu=%d\n",
+                step_offsets.at<int32_t>(0), use_gpu_beam_pipeline ? 1 : 0);
+      }
+
       auto t3 = Clock::now();
       t_step_setup += elapsed_ms(t2, t3);
 
@@ -1448,6 +1458,17 @@ namespace ctranslate2 {
         topk_scores_step = topk_scores_step.to(Device::CPU);
         topk_ids = topk_ids.to(Device::CPU);
 
+        // Debug: dump TopK results for first slot.
+        if (debug_defrag && active_count > 0) {
+          fprintf(stderr, "[CPU_TOPK] slot0 top3: ");
+          for (dim_t k = 0; k < 3 && k < num_candidates; ++k) {
+            int32_t flat = topk_ids.at<int32_t>({0, k});
+            float sc = topk_scores_step.at<float>({0, k});
+            fprintf(stderr, "id=%d(b%d,w%d,sc=%.2f) ", flat, (int)(flat/vocab_size), (int)(flat%vocab_size), sc);
+          }
+          fprintf(stderr, "\n");
+        }
+
         StorageView& gather_indices = gather_indices_scratch;
         for (dim_t i = 0; i < total_batch; ++i)
           gather_indices.at<int32_t>(i) = i;
@@ -1679,6 +1700,19 @@ namespace ctranslate2 {
             : gpu_topk_scores;
         auto& topk_scores_step = topk_scores_f32;
         auto& topk_ids = gpu_topk_ids;
+
+        // Debug: dump TopK results for first slot.
+        if (debug_defrag && active_count > 0) {
+          StorageView ids_cpu = topk_ids.to(Device::CPU);
+          StorageView scores_cpu = topk_scores_step.to(Device::CPU);
+          fprintf(stderr, "[GPU_TOPK] slot0 top3: ");
+          for (dim_t k = 0; k < 3 && k < num_candidates; ++k) {
+            int32_t flat = ids_cpu.at<int32_t>({0, k});
+            float sc = scores_cpu.at<float>({0, k});
+            fprintf(stderr, "id=%d(b%d,w%d,sc=%.2f) ", flat, (int)(flat/vocab_size), (int)(flat%vocab_size), sc);
+          }
+          fprintf(stderr, "\n");
+        }
 
         // 5. GPU beam selection kernel — produces gather_indices, next_tokens,
         //    beam_scores, beam_finished, slot_finished, EOS info on GPU.
