@@ -917,9 +917,7 @@ namespace ctranslate2 {
     if (_beam_size > 1 && device != Device::CPU)
       gather_device_persistent = StorageView({total_batch}, DataType::INT32, device);
 
-    // Delayed-by-one-step flag: were ALL active slots identity gathers last step?
-    // Used in Phase C to skip the KV-cache Gather when beams have converged.
-    bool prev_step_all_identity = false;
+
 
     // --- Step-level timing instrumentation ---
     using Clock = std::chrono::high_resolution_clock;
@@ -1345,12 +1343,7 @@ namespace ctranslate2 {
             }
           }
 
-          // Set flag for Phase C: were all slots identity-gather in the previous step?
-          bool all_id = true;
-          for (size_t s = 0; s < sync_active_count && all_id; ++s)
-            if (staging_needs_gather[pending_staging_map[s]] != 0)
-              all_id = false;
-          prev_step_all_identity = all_id;
+
 
           pending_beam_sync = false;
       }
@@ -1800,8 +1793,9 @@ namespace ctranslate2 {
           resize_batch_state(batch_state, static_cast<dim_t>(_max_slots));
 
         // 7. Apply beam reordering using GPU-resident gather_indices.
-        //    Skip entirely when previous step had all-identity gathers (beams converged).
-        if (!prev_step_all_identity) {
+        //    Always apply — skipping based on previous step's pattern is unsafe because
+        //    identity gathers one step don't guarantee identity the next step.
+        {
           // Build full gather indices using the pre-allocated persistent buffer.
           // fill_identity_async fills all rows asynchronously, then we overwrite
           // the active portion with beam_select output (D2D copy).
