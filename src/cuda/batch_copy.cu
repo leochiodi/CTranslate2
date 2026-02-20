@@ -30,7 +30,7 @@ namespace ctranslate2 {
       }
     }
 
-    static constexpr int MAX_BATCH_COPIES = 128;
+    static constexpr int MAX_BATCH_COPIES = 1024;
 
     void batch_copy_async(const std::vector<CopyDescriptor>& copies) {
       if (copies.empty())

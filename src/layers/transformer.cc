@@ -1,6 +1,14 @@
 #include "ctranslate2/layers/transformer.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <chrono>
+
+#include "ctranslate2/devices.h"
+
+#ifdef CT2_WITH_CUDA
+#include "cuda/utils.h"
+#endif
 
 namespace ctranslate2 {
   namespace layers {
@@ -308,6 +316,19 @@ namespace ctranslate2 {
 
         return;
       }
+      // --- Sub-layer profiling (CT2_SUBLAYER_PROFILE env var) ---
+      static const bool sp_enabled = std::getenv("CT2_SUBLAYER_PROFILE") != nullptr;
+      static thread_local size_t sp_calls = 0;
+      static thread_local double sp_self_attn_ms = 0;
+      static thread_local double sp_cross_attn_ms = 0;
+      static thread_local double sp_ffn_ms = 0;
+
+#ifdef CT2_WITH_CUDA
+      if (sp_enabled && device == Device::CUDA)
+        synchronize_stream(device);
+      auto sp_t0 = std::chrono::steady_clock::now();
+#endif
+
       if (_self_attention)
         (*_self_attention)(input,
                       input,
@@ -321,6 +342,12 @@ namespace ctranslate2 {
                       true,
                       position_bias,
                       offset);
+
+#ifdef CT2_WITH_CUDA
+      if (sp_enabled && device == Device::CUDA)
+        synchronize_stream(device);
+      auto sp_t1 = std::chrono::steady_clock::now();
+#endif
 
       StorageView context(dtype, device);
       if (_encoder_attention) {
@@ -339,7 +366,43 @@ namespace ctranslate2 {
         context = std::move(output);
       }
 
+#ifdef CT2_WITH_CUDA
+      if (sp_enabled && device == Device::CUDA)
+        synchronize_stream(device);
+      auto sp_t2 = std::chrono::steady_clock::now();
+#endif
+
       _ff(context, output);
+
+#ifdef CT2_WITH_CUDA
+      if (sp_enabled && device == Device::CUDA) {
+        synchronize_stream(device);
+        auto sp_t3 = std::chrono::steady_clock::now();
+        auto ms = [](auto a, auto b) {
+          return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        sp_self_attn_ms += ms(sp_t0, sp_t1);
+        sp_cross_attn_ms += ms(sp_t1, sp_t2);
+        sp_ffn_ms += ms(sp_t2, sp_t3);
+        ++sp_calls;
+
+        // Print every 16000 calls (= 500 decode steps × 32 layers).
+        if (sp_calls % 16000 == 0) {
+          const double steps = sp_calls / 32.0;
+          fprintf(stderr, "[SUBLAYER PROFILE] calls=%zu (%.0f steps)\n"
+                          "  self_attn: total=%.1fms  per_layer=%.3fms  per_step=%.2fms (%.1f%%)\n"
+                          "  cross_attn: total=%.1fms  per_layer=%.3fms  per_step=%.2fms (%.1f%%)\n"
+                          "  ffn:       total=%.1fms  per_layer=%.3fms  per_step=%.2fms (%.1f%%)\n",
+                  sp_calls, steps,
+                  sp_self_attn_ms, sp_self_attn_ms / sp_calls, sp_self_attn_ms / steps,
+                  100.0 * sp_self_attn_ms / (sp_self_attn_ms + sp_cross_attn_ms + sp_ffn_ms),
+                  sp_cross_attn_ms, sp_cross_attn_ms / sp_calls, sp_cross_attn_ms / steps,
+                  100.0 * sp_cross_attn_ms / (sp_self_attn_ms + sp_cross_attn_ms + sp_ffn_ms),
+                  sp_ffn_ms, sp_ffn_ms / sp_calls, sp_ffn_ms / steps,
+                  100.0 * sp_ffn_ms / (sp_self_attn_ms + sp_cross_attn_ms + sp_ffn_ms));
+        }
+      }
+#endif
     }
 
 
@@ -992,6 +1055,14 @@ namespace ctranslate2 {
       const StorageView* write_pos = (wp_it != state.end() && wp_it->second)
                                      ? &wp_it->second : nullptr;
 
+      // --- Per-layer profiling (CT2_LAYER_PROFILE env var) ---
+      static const bool layer_profile = std::getenv("CT2_LAYER_PROFILE") != nullptr;
+      static thread_local size_t lp_call_count = 0;
+      static thread_local double lp_total_layer_ms = 0;
+      static thread_local std::vector<double> lp_layer_ms;
+      if (layer_profile && lp_layer_ms.size() != _layers.size())
+        lp_layer_ms.assign(_layers.size(), 0.0);
+
       // No sliding window chunking — Whisper doesn't use it.
       for (size_t l = 0; l < _layers.size(); ++l) {
         StorageView* cached_self_attn_keys = nullptr;
@@ -1016,6 +1087,12 @@ namespace ctranslate2 {
         if (attention && heads_to_select)
           layer_attention = std::make_unique<StorageView>(device);
 
+#ifdef CT2_WITH_CUDA
+        if (layer_profile && device == Device::CUDA)
+          synchronize_stream(device);
+        auto lp_t0 = std::chrono::steady_clock::now();
+#endif
+
         // offset=0 for per-element (position already encoded via per-element offsets).
         (*_layers[l])(layer_in,
                       input_lengths_mask.get(),
@@ -1032,6 +1109,17 @@ namespace ctranslate2 {
                       return_normalized_attention(),
                       &position_bias,
                       /*offset=*/0);
+
+#ifdef CT2_WITH_CUDA
+        if (layer_profile && device == Device::CUDA) {
+          synchronize_stream(device);
+          auto lp_t1 = std::chrono::steady_clock::now();
+          double ms = std::chrono::duration<double, std::milli>(lp_t1 - lp_t0).count();
+          lp_layer_ms[l] += ms;
+          lp_total_layer_ms += ms;
+        }
+#endif
+
         layer_in = std::move(layer_out);
 
         // Clear scatter positions after each layer call.
@@ -1041,6 +1129,19 @@ namespace ctranslate2 {
           // Use layer_attention's actual dtype (may differ from output_type() in mixed precision).
           alignment_heads.emplace_back(layer_attention->dtype(), device);
           ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
+        }
+      }
+
+      // Print per-layer profile every 500 calls.
+      if (layer_profile) {
+        ++lp_call_count;
+        if (lp_call_count % 500 == 0) {
+          fprintf(stderr, "[LAYER PROFILE] calls=%zu total=%.1fms per_call=%.2fms\n",
+                  lp_call_count, lp_total_layer_ms, lp_total_layer_ms / lp_call_count);
+          for (size_t l = 0; l < lp_layer_ms.size(); ++l) {
+            fprintf(stderr, "  layer[%zu] = %.1fms (%.2fms/call)\n",
+                    l, lp_layer_ms[l], lp_layer_ms[l] / lp_call_count);
+          }
         }
       }
 

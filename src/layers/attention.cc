@@ -66,6 +66,8 @@ namespace ctranslate2 {
           return;
         }
 
+        // Non-uniform positions: batch_copy_async with all copies in a single kernel.
+        // MAX_BATCH_COPIES=1024 ensures all copies fit in one launch (typ. 800 for 8 slots).
         std::vector<cuda::CopyDescriptor> copies;
         copies.reserve(batch * heads);
 

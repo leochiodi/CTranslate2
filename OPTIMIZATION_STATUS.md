@@ -223,7 +223,188 @@ WHISPER_MODEL=/workspace/models/whisper-large-v3 NUM_WORKERS=4 BATCH_SIZE=16 MAX
 
 ## Environment
 
-- RunPod H100 SXM
+- RunPod H100 SXM (original benchmarks)
+- RunPod L4 (current iteration — much less compute, ~80 users is unrealistic)
 - Three venvs: `/root/venv_old` (stock faster-whisper), `/root/venv_new` (custom CT2), `/root/venv_bench` (benchmark client)
 - Model: `/workspace/models/whisper-large-v3`
 - Audio: `ctranslate2-server/f1_audio.mp3` (~9min F1 commentary, split into 30s chunks)
+
+## Optimization Attempt #1 (2026-02-20, L4)
+
+### Changes made
+
+1. **`src/cuda/batch_copy.cu`**: Increased `MAX_BATCH_COPIES` from 128 → 1024.
+   - Rationale: with 8 slots × beam_size 5 × 20 heads = 800 copy descriptors per scatter call, the old limit caused `ceil(800/128) = 7` recursive kernel launches per call. With 1024, all copies fit in a single kernel launch.
+   - Expected: reduce scatter kernel launches from ~448/step to ~64/step.
+
+2. **`src/layers/attention.cc`**: Added comment documenting the single-launch benefit.
+
+3. **`src/layers/transformer.cc`**: Added per-layer CUDA event profiling gated behind `CT2_LAYER_PROFILE` env var. When set, synchronizes GPU after each layer and prints per-layer timing every 500 decode calls. Overhead is significant (do NOT use in production).
+
+### What was tried and reverted
+
+- **Grouped scatter with per-slot `cudaMemcpy2D`**: Replaced `batch_copy_async` with per-group `cudaMemcpy2D` calls (one per unique write position = one per slot). This produced 512 API calls per step vs 64 kernel launches with increased `MAX_BATCH_COPIES`. Result: **81.79ms/step — WORSE than baseline (was ~36ms at same users)**. Each `cudaMemcpy2D` for D2D is internally a kernel launch, so 512 calls >> 64 calls. **Reverted.**
+
+### L4 baseline results (e4_s8, 20 users, 2 loops)
+
+| Metric | Value |
+|--------|-------|
+| p50 latency | 5.09s |
+| p95 latency | 6.33s |
+| Throughput | 0.63 req/s |
+| per_step (high load) | 36.45-36.71ms |
+| per_step (low load) | 16.37-18.94ms |
+| GPU% (high load) | 89-91% |
+
+### Per-layer profiling (e4_s8, 20 users, CT2_LAYER_PROFILE=1)
+
+With GPU sync after each layer (adds overhead but gives accurate per-layer GPU time):
+- Total across 32 layers: ~17.5ms per decode step
+- Per layer: 0.43–0.91ms (varies by layer, early layers slightly slower)
+- This 17.5ms is **actual GPU compute time** — the remaining gap to the 36ms per_step is kernel launch overhead, stream scheduling, and CB machinery
+
+### L4 config comparison: e4_s8 vs e2_s4 (baseline, 20 users)
+
+| Config | p50 | p95 | Throughput | per_step (high) | GPU% (high) |
+|--------|-----|-----|------------|------------------|-------------|
+| e4_s8 | 5.09s | 6.33s | 0.63 req/s | 36.45ms | 89-91% |
+| **e2_s4** | **2.72s** | **5.60s** | **0.66 req/s** | 19-25ms | 87-89% |
+
+**e2_s4 is clearly better on L4** — 47% lower p50, slightly higher throughput. The L4 doesn't have enough compute to keep 8 slots busy efficiently.
+
+### A/B: `MAX_BATCH_COPIES=1024` vs baseline (e2_s4, 20 users)
+
+| Version | p50 | p95 | Throughput | per_step (high) |
+|---------|-----|-----|------------|------------------|
+| Baseline (128) | 2.72s | 5.60s | 0.66 req/s | 19-25ms |
+| Optimized (1024) | 3.80s | 6.08s | 0.66 req/s | 17-29ms |
+
+**Result: neutral to slightly worse.** On L4 with e2_s4 (4 slots × 5 beams × 20 heads = 400 copies), baseline only does `ceil(400/128) = 4` launches. Reducing 4→1 doesn't save enough to matter. The **actual decoder computation** (~17ms GPU time per step) dominates, not launch overhead.
+
+### Key insight from profiling
+
+The per-layer profile shows the decoder's real GPU time is ~17.5ms per step (all 32 layers). On the L4, the wall-clock per_step is 19-36ms depending on load. The ~2-18ms gap is:
+- CB machinery (slot mgmt, cache padding, beam selection): ~2-4ms
+- Kernel launch scheduling / stream overhead: ~0-14ms (scales with load and GPU contention)
+
+The scatter launch overhead (reduced by MAX_BATCH_COPIES) is a small part of this gap. The dominant issue remains: **each decoder layer in CB is doing ~0.55ms of GPU compute**, while the standard `generate()` path does the equivalent in ~0.3ms/layer (estimated from 10ms / 32 layers at same batch size on H100).
+
+## Sub-layer Profiling Results (2026-02-20, L4, e2_s4, 20 users)
+
+Added `CT2_SUBLAYER_PROFILE` env var to time self-attention, cross-attention, and FFN separately within each `TransformerDecoderLayer`. GPU sync before/after each sub-operation for accurate timing.
+
+### Per decode step (averaged over 2500 steps, 32 layers each):
+
+| Sub-operation | Per-step (32 layers) | Per-layer | % of in-layer GPU time |
+|---|---|---|---|
+| Self-attention | 7.04ms | 0.220ms | 35.3% |
+| Cross-attention | 7.34ms | 0.229ms | 36.8% |
+| FFN | 5.58ms | 0.174ms | 27.9% |
+| **Total in-layer** | **19.96ms** | **0.624ms** | 100% |
+
+Wall-clock per_step: 29.57ms → **~10ms gap** between sublayer total and wall clock.
+
+### Critical insight: CB in-layer overhead is negligible
+
+**Cross-attention is identical between CB and standard paths** — same code, same cached K/V from the encoder. It costs 7.34ms per step.
+
+**Self-attention (CB path, with mask + scatter + padding) costs 7.04ms** — actually 0.30ms LESS than cross-attention.
+
+This means: **all the CB-specific changes (mask construction, scatter writes, padded cache) add < 0.5ms total across 32 layers per step.** The self-attention cost is dominated by Q/K/V projections and memory bandwidth, not by CB-specific overhead.
+
+The earlier "0.55 vs 0.3 ms/layer = 1.8× overhead" estimate was misleading — the 0.3ms/layer H100 estimate was from a much faster GPU (11× bandwidth, 4× compute). On L4, the standard path would also take ~0.2ms/layer for cross-attn and FFN.
+
+### Why FFN is the cheapest despite being the most compute
+
+FFN reads 2 weight matrices of d_model × d_ff = 1280 × 5120 = 6.55M params × 2 bytes = ~13.1 MB per layer, ~419 MB for 32 layers. At L4's ~300 GB/s → ~1.4ms theoretical. Measured 5.58ms reflects both up+down projections at near-roofline for fp16 GEMM at batch=20.
+
+### The 10ms gap is the real optimization target
+
+| Component | Estimated cost |
+|---|---|
+| CB machinery (beam selection, slot mgmt, fill, defrag) | ~3-4ms |
+| LM head projection (1280→51864 vocab) | ~0.5-1ms |
+| Output norm + embedding + position encoding | ~0.5-1ms |
+| Kernel launch overhead (hundreds of launches per step) | ~2-3ms |
+| Other (memory allocation, CPU↔GPU transfers) | ~1-2ms |
+
+### Updated conclusions
+
+1. **Optimizing inside layers (mask, scatter, chunk_size) is NOT worthwhile** — total CB overhead there is < 0.5ms
+2. **The "fast CB path" (uniform cache_lengths → skip mask) would save < 0.5ms** and almost never triggers anyway
+3. **MAX_BATCH_COPIES change was neutral** because scatter overhead was already small
+4. The ~10ms out-of-layer gap is split between inherent CB machinery costs and kernel launch overhead
+
+## End-to-End A/B: CB vs Old Server on L4 (2026-02-20)
+
+### Hardware & setup
+
+- **GPU**: NVIDIA L4 (Ada Lovelace, 58 SMs, ~23GB GDDR6, ~300 GB/s bandwidth)
+- **Model**: Whisper large-v3 (CT2 fp16), `/workspace/models/whisper-large-v3`
+- **Audio**: `f1_audio.mp3` (~9min F1 commentary, split into 30s chunks = 18 chunks)
+- **Benchmark**: 20 concurrent users, 3 loops each, jitter 0-30s, SLA threshold 5s
+- **Pyannote VAD model** required for old server: `pyannote/segmentation-3.0` downloaded to `/workspace/models/ModelHub-model-huggingface-pyannote/segmentation-3.0/main/`
+
+### CB server config
+
+```bash
+WHISPER_MODEL=/workspace/models/whisper-large-v3 NUM_ENCODERS=2 MAX_SLOTS=4 \
+    DEVICE=cuda COMPUTE_TYPE=float16 BEAM_SIZE=5 REQUEST_TIMEOUT=120 DEFAULT_LANGUAGE=fr \
+    LD_LIBRARY_PATH=/workspace/CTranslate2/build:$LD_LIBRARY_PATH \
+    /root/venv_new/bin/python -m uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+### Old server configs tested
+
+```bash
+# 2 workers (best on L4):
+WHISPER_MODEL=/workspace/models/whisper-large-v3 NUM_WORKERS=2 BATCH_SIZE=16 MAX_AGE=2.0 \
+    DEVICE=cuda COMPUTE_TYPE=float16 BEAM_SIZE=5 REQUEST_TIMEOUT=120 DEFAULT_LANGUAGE=fr \
+    MODELHUB_DIR=/workspace/models \
+    /root/venv_old/bin/python -m uvicorn server_old:app --host 0.0.0.0 --port 8010
+
+# 3 workers (worse on L4 — GPU contention):
+# Same as above but NUM_WORKERS=3
+```
+
+### Results (20 users, 3 loops, L4)
+
+| Server | Config | p50 | p95 | Throughput | SLA violations (>5s) |
+|---|---|---|---|---|---|
+| **CB** | **e2_s4 (2 enc, 4 slots)** | **3.74s** | **5.06s** | **0.65 req/s** | **5%** |
+| Old | 2 workers, pyannote VAD | 6.18s | 7.79s | 0.65 req/s | 81.7% |
+| Old | 3 workers, pyannote VAD | 10.91s | 13.26s | 0.64 req/s | 91.7% |
+
+**CB is 1.65× faster at p50 on L4** with identical throughput. Old server with 3 workers suffers from GPU contention — throughput stays flat but latency nearly doubles.
+
+### Why CB wins despite slower per-step decode
+
+The CB decode step is slower per-step than standard `generate()` (sub-layer profiling shows < 0.5ms of CB-specific overhead, but ~10ms of out-of-layer overhead from CB machinery). However, the end-to-end result is faster because:
+
+1. **No batch-wait delay** — old server waits `MAX_AGE=2.0s` to accumulate a batch; CB starts decoding immediately when a slot is free
+2. **Overlapped encoding and decoding** — CB encoder threads run concurrently with the decoder thread; old server's GIL serializes everything
+3. **No idle GPU gaps** — CB continuously feeds the GPU; old server has gaps between batch completions and next batch formation
+
+### Replication on H100
+
+On H100 SXM (132 SMs, 80GB HBM3, 3.35 TB/s), the per-step decode overhead is proportionally larger relative to compute time (compute is ~4× faster but overhead stays similar). Use higher concurrency:
+
+```bash
+# CB server on H100 — try e4_s8 or e8_s16:
+NUM_ENCODERS=4 MAX_SLOTS=8   # or NUM_ENCODERS=8 MAX_SLOTS=16
+
+# Old server on H100 — try 4-8 workers:
+NUM_WORKERS=4   # or NUM_WORKERS=8
+
+# Benchmark with more users:
+bench_compare.py --users 80 --loops 3 --abort-sla 15
+```
+
+The H100 has enough compute and bandwidth to support more concurrent slots/workers. The relative CB vs old server comparison may differ there — the per-step decode overhead (measured at ~46ms for 40 seqs on H100 vs ~10ms for standard) is a larger fraction of total time.
+
+### Remaining investigation
+
+- Profile the **out-of-layer overhead** in detail: what specifically costs ~10ms between sublayer total (20ms) and wall-clock per_step (30ms)?
+- Consider **CUDA graphs** for the repeated decoder layer calls (but CB's dynamic batch sizes make this hard)
+- Consider **fusing beam selection with GPU** to reduce CPU→GPU roundtrips
+- Re-test on **H100** where the per-step overhead is more pronounced relative to compute speed
