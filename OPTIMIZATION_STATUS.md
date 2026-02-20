@@ -408,3 +408,69 @@ The H100 has enough compute and bandwidth to support more concurrent slots/worke
 - Consider **CUDA graphs** for the repeated decoder layer calls (but CB's dynamic batch sizes make this hard)
 - Consider **fusing beam selection with GPU** to reduce CPU→GPU roundtrips
 - Re-test on **H100** where the per-step overhead is more pronounced relative to compute speed
+
+## Optimization: VAD Segment Merging (2026-02-20, H100)
+
+### Problem
+
+The server submitted each individual VAD segment as a separate batcher slot. A 30s audio with 5 VAD chunks → 5 slots × 5 beams = 25 batch rows per request. With `max_slots=8`, one request nearly fills the entire decoder batch. Only 1-2 requests can decode at a time.
+
+### Fix: `merge_vad_segments()` in server.py
+
+Added a merging step after VAD, before mel extraction. Adjacent VAD segments whose combined span (first start to last end) stays under 30s are merged into a single chunk. The original waveform between segments (natural silences) is preserved so that word-level timestamps remain correct.
+
+**Key difference from `faster_whisper.vad.collect_chunks()`**: collect_chunks concatenates speech-only (strips silence). Our merge preserves the original audio timeline for correct word alignment.
+
+Result: a typical 30s audio file now produces ~1 merged chunk instead of ~3-5 separate VAD segments. This reduces slot usage per request by 3-5×.
+
+### H100 profiling results (20 users, 35s audio, e6_s24)
+
+```
+DECODE PROFILE: steps=58  total=1138ms  per_step=19.63ms  GPU%=69.4%
+  DECODER=790ms  selection=208ms  fill=104ms
+
+Per-request (35s audio, 20 concurrent):
+  audio_decode:  0.13s
+  vad:           0.10s
+  mel+submit:    0.01-0.19s
+  seg_wait:      1.32-1.55s  (encoder + decoder, all 20 fit in 24 slots)
+  align:         0.01-0.08s
+  total:         ~1.8s
+```
+
+All 20 requests completed in ~1.8s with zero queuing. Decoder processed all 20 simultaneously (20 slots × 5 beams = 100 batch rows).
+
+### Benchmark results (80 users, e4_s16, 30s chunks from f1_audio.mp3)
+
+```
+Total: 106  OK: 106  Failed: 0  Wall: 70.9s
+  p50: 16.05s    p90: 31.18s    p95: 31.79s
+  SLA violations (>5s): 82.1%
+  Throughput: 1.49 req/s
+  Aborted at p95 > 15s SLA
+```
+
+**p50=16s is much better than pre-merge (~35s)** but still far from the <5s target. The bottleneck is **decoder slot queuing** — with 16 slots, only 16 of 80 users can decode concurrently. Each "wave" takes ~1.1-1.5s, so requests queue 4-5 deep.
+
+### Analysis: where is the bottleneck?
+
+| Component | Time | Bottleneck? |
+|---|---|---|
+| Encoder (batch-encodes all queued) | ~0.2s for batch of 20 | No — batches efficiently |
+| Decoder per-step (100 batch rows) | 19.6ms | Moderate — scales with batch size |
+| Decoder total (58 steps) | 1.1s | No — fast per wave |
+| **Decoder slot queuing (80 users, 24 slots)** | **~3-4 waves × 1.1s** | **YES — primary bottleneck** |
+
+### Configs tested / planned
+
+| Config | Encoders | Slots | Batch rows | Status |
+|---|---|---|---|---|
+| e4_s16_merged | 4 | 16 | 80 | Tested: p50=16s (80 users) |
+| e6_s24_merged | 6 | 24 | 120 | Started but not benchmarked yet |
+
+### Next steps
+
+1. Benchmark e6_s24 at 80 users (expect p50 ~8-10s based on slot math)
+2. Try higher slot counts (e6_s32, e6_s48) — H100 GPU% was only 69.4% at 20 users, plenty of headroom
+3. Consider reducing beam_size from 5→1 (greedy) to reduce batch rows by 5× — quality tradeoff
+4. Consider asymmetric approach: larger max_slots + more encoder threads to max out H100 utilization

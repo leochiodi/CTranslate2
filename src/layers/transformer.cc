@@ -678,6 +678,25 @@ namespace ctranslate2 {
       const Device device = ids.device();
       const bool is_sequence = ids.rank() > 1;
 
+      // --- Decode phase profiling (CT2_DECODE_PHASE_PROFILE env var) ---
+      static const bool dp_std_enabled = std::getenv("CT2_DECODE_PHASE_PROFILE") != nullptr;
+      static thread_local size_t dp_std_calls = 0;
+      static thread_local double dp_std_B = 0, dp_std_C = 0, dp_std_D = 0;
+      static thread_local double dp_std_E = 0, dp_std_F = 0, dp_std_G = 0;
+      static thread_local double dp_std_H = 0, dp_std_I = 0, dp_std_total = 0;
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_sync_now = [&]() -> std::chrono::steady_clock::time_point {
+        if (dp_std_enabled && device == Device::CUDA)
+          synchronize_stream(device);
+        return std::chrono::steady_clock::now();
+      };
+      auto dp_std_ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      auto dp_std_t_start = dp_std_sync_now();
+#endif
+
       StorageView layer_in(dtype, device);
       StorageView layer_out(dtype, device);
 
@@ -692,10 +711,24 @@ namespace ctranslate2 {
       }
       if (layer_in.rank() == 2)
         layer_in.expand_dims(1);
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t2 = dp_std_sync_now();  // End Phase B (embed+scale)
+#endif
+
       if (_position_encoder)
         (*_position_encoder)(layer_in, std::max(step, dim_t(0)));
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t3 = dp_std_sync_now();  // End Phase C (pos encoding)
+#endif
+
       if (_layernorm_embedding)
         (*_layernorm_embedding)(layer_in, layer_in);
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t4 = dp_std_sync_now();  // End Phase D (layernorm_emb)
+#endif
 
       const dim_t batch_size = layer_in.dim(0);
       dim_t max_time;
@@ -743,6 +776,10 @@ namespace ctranslate2 {
         input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
       }
 
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t5 = dp_std_sync_now();  // End Phase E (attn mask)
+#endif
+
       StorageView* memory = nullptr;
       std::unique_ptr<const StorageView> memory_lengths_mask;
       std::unique_ptr<const Padder> memory_padder;
@@ -771,6 +808,10 @@ namespace ctranslate2 {
                                                             beam_size > 1 ? beam_size : max_time));
         }
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t6 = dp_std_sync_now();  // End Phase F (memory setup)
+#endif
 
       std::vector<StorageView> alignment_heads;
       if (attention)
@@ -864,6 +905,10 @@ namespace ctranslate2 {
         layer_in = std::move(*layer_in_chunk);
       }
 
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t7 = dp_std_sync_now();  // End Phase G (layer loop)
+#endif
+
       if (step == 0 && state.count("_retain_memory") == 0) {
         // The memory is no longer needed as its projections were cached in the first step.
         state.erase("memory");
@@ -887,6 +932,10 @@ namespace ctranslate2 {
         }
       }
 
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t8 = dp_std_sync_now();  // End Phase H (attn concat)
+#endif
+
       if (outputs) {
         if (_output_norm)
           (*_output_norm)(layer_in, layer_in);
@@ -908,6 +957,46 @@ namespace ctranslate2 {
         else if (input_padder)
           input_padder->add_padding(*outputs);
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_std_t9 = dp_std_sync_now();  // End Phase I (norm+lm_head)
+
+      if (dp_std_enabled && device == Device::CUDA) {
+        dp_std_B += dp_std_ms(dp_std_t_start, dp_std_t2);
+        dp_std_C += dp_std_ms(dp_std_t2, dp_std_t3);
+        dp_std_D += dp_std_ms(dp_std_t3, dp_std_t4);
+        dp_std_E += dp_std_ms(dp_std_t4, dp_std_t5);
+        dp_std_F += dp_std_ms(dp_std_t5, dp_std_t6);
+        dp_std_G += dp_std_ms(dp_std_t6, dp_std_t7);
+        dp_std_H += dp_std_ms(dp_std_t7, dp_std_t8);
+        dp_std_I += dp_std_ms(dp_std_t8, dp_std_t9);
+        dp_std_total += dp_std_ms(dp_std_t_start, dp_std_t9);
+        ++dp_std_calls;
+
+        if (dp_std_calls % 500 == 0) {
+          auto pct = [&](double v) { return dp_std_total > 0 ? 100.0 * v / dp_std_total : 0.0; };
+          fprintf(stderr,
+            "[DECODE PHASE STD] calls=%zu  total=%.1fms (%.2fms/call)\n"
+            "  B embed+scale:    %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  C pos_encoding:   %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  D layernorm_emb:  %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  E attn_mask:      %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  F memory_setup:   %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  G layer_loop:     %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  H attn_concat:    %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  I norm+lm_head:   %8.1fms  %5.2fms/call  %5.1f%%\n",
+            dp_std_calls, dp_std_total, dp_std_total / dp_std_calls,
+            dp_std_B, dp_std_B / dp_std_calls, pct(dp_std_B),
+            dp_std_C, dp_std_C / dp_std_calls, pct(dp_std_C),
+            dp_std_D, dp_std_D / dp_std_calls, pct(dp_std_D),
+            dp_std_E, dp_std_E / dp_std_calls, pct(dp_std_E),
+            dp_std_F, dp_std_F / dp_std_calls, pct(dp_std_F),
+            dp_std_G, dp_std_G / dp_std_calls, pct(dp_std_G),
+            dp_std_H, dp_std_H / dp_std_calls, pct(dp_std_H),
+            dp_std_I, dp_std_I / dp_std_calls, pct(dp_std_I));
+        }
+      }
+#endif
     }
 
     void TransformerDecoder::decode(const StorageView& ids,
@@ -922,6 +1011,27 @@ namespace ctranslate2 {
       const DataType dtype = output_type();
       const Device device = ids.device();
       const bool is_sequence = ids.rank() > 1;
+
+      // --- Decode phase profiling (CT2_DECODE_PHASE_PROFILE env var) ---
+      static const bool dp_enabled = std::getenv("CT2_DECODE_PHASE_PROFILE") != nullptr;
+      static thread_local size_t dp_calls = 0;
+      static thread_local double dp_A = 0, dp_B = 0, dp_C = 0, dp_D = 0;
+      static thread_local double dp_E = 0, dp_F = 0, dp_G = 0, dp_H = 0, dp_I = 0;
+      static thread_local double dp_total = 0;
+
+#ifdef CT2_WITH_CUDA
+      auto dp_sync_now = [&]() -> std::chrono::steady_clock::time_point {
+        if (dp_enabled && device == Device::CUDA)
+          synchronize_stream(device);
+        return std::chrono::steady_clock::now();
+      };
+      auto dp_ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      auto dp_t_total_start = dp_sync_now();
+      // Phase A: offsets CPU read + min_step loop
+      auto dp_t0 = dp_t_total_start;
+#endif
 
       // Read offsets on CPU for control flow decisions.
       // Check batch_state for pre-computed CPU copy to avoid GPU→CPU sync.
@@ -938,6 +1048,10 @@ namespace ctranslate2 {
       dim_t min_step = offsets_cpu.at<int32_t>(0);
       for (dim_t i = 1; i < batch_size_raw; ++i)
         min_step = std::min(min_step, dim_t(offsets_cpu.at<int32_t>(i)));
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t1 = dp_sync_now();  // End Phase A
+#endif
 
       StorageView layer_in(dtype, device);
       StorageView layer_out(dtype, device);
@@ -956,13 +1070,25 @@ namespace ctranslate2 {
       if (layer_in.rank() == 2)
         layer_in.expand_dims(1);
 
+#ifdef CT2_WITH_CUDA
+      auto dp_t2 = dp_sync_now();  // End Phase B (embedding + scale + project_in)
+#endif
+
       // Per-element position encoding.
       // Pass CPU offsets to avoid GPU→CPU sync inside the position encoder.
       if (_position_encoder)
         (*_position_encoder)(layer_in, static_cast<const StorageView&>(offsets_cpu));
 
+#ifdef CT2_WITH_CUDA
+      auto dp_t3 = dp_sync_now();  // End Phase C (position encoding)
+#endif
+
       if (_layernorm_embedding)
         (*_layernorm_embedding)(layer_in, layer_in);
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t4 = dp_sync_now();  // End Phase D (layernorm_embedding)
+#endif
 
       const dim_t batch_size = layer_in.dim(0);
       const dim_t max_time = layer_in.dim(1);
@@ -976,11 +1102,6 @@ namespace ctranslate2 {
       bool multi_query = _layers.front()->get_self_attention().multi_query();
 
       // Build per-element attention mask using cache_lengths from state if available.
-      // cache_lengths tracks valid (non-padded) cache entries per element.
-      //
-      // When "no_self_attn_mask" is set, all cache_lengths are identical and
-      // the cache has no padding — we can skip the mask entirely, matching the
-      // standard generate() code path (no mask for self-attention).
       const bool skip_self_mask = state.count("no_self_attn_mask") > 0;
       const auto cache_lengths_it = state.find("cache_lengths");
       if (cache_lengths_it != state.end() && !skip_self_mask) {
@@ -988,8 +1109,6 @@ namespace ctranslate2 {
         if (_tensor_parallel)
           num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
 
-        // cache_lengths: [batch_size] INT32 on CPU — valid cache entries per element.
-        // The attention mask should allow attending to cache_lengths[b] + time positions.
         StorageView attn_lengths({batch_size}, DataType::INT32);
         const StorageView& cl = cache_lengths_it->second;
 
@@ -999,11 +1118,6 @@ namespace ctranslate2 {
         if (device != Device::CPU)
           attn_lengths = attn_lengths.to(device);
 
-        // The mask has one entry per (batch, head, query) telling softmax how many
-        // key positions are valid.  num_queries = max_time (the query dimension,
-        // typically 1 during iterative decoding).  mask_future must be false so
-        // that each entry simply equals attn_lengths[b] rather than being clamped
-        // to min(attn_lengths[b], q+1).
         StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
           attn_lengths,
           num_heads,
@@ -1013,6 +1127,10 @@ namespace ctranslate2 {
 
         input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t5 = dp_sync_now();  // End Phase E (attention mask)
+#endif
 
       // Access encoder memory when any element needs cross-attention projection.
       StorageView* memory = nullptr;
@@ -1043,6 +1161,10 @@ namespace ctranslate2 {
                                                             beam_size > 1 ? beam_size : max_time));
         }
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t6 = dp_sync_now();  // End Phase F (memory setup)
+#endif
 
       std::vector<StorageView> alignment_heads;
       if (attention)
@@ -1132,6 +1254,10 @@ namespace ctranslate2 {
         }
       }
 
+#ifdef CT2_WITH_CUDA
+      auto dp_t7 = dp_sync_now();  // End Phase G (layer loop)
+#endif
+
       // Print per-layer profile every 500 calls.
       if (layer_profile) {
         ++lp_call_count;
@@ -1152,9 +1278,6 @@ namespace ctranslate2 {
 
       if (attention && !alignment_heads.empty()) {
         // Ensure attention output has the correct dtype/device from the alignment heads.
-        // In mixed precision (e.g. compute_type='float16'), attention weights are float16
-        // but the caller may have created *attention with default dtype (float32).
-        // Concat/Mean dispatch on output dtype, so we must match the input dtype.
         const auto heads_dtype = alignment_heads.front().dtype();
         const auto heads_device = alignment_heads.front().device();
         if (attention->dtype() != heads_dtype || attention->device() != heads_device)
@@ -1174,6 +1297,10 @@ namespace ctranslate2 {
             attention->squeeze(2);
         }
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t8 = dp_sync_now();  // End Phase H (attention concat)
+#endif
 
       if (outputs) {
         if (_output_norm)
@@ -1196,6 +1323,49 @@ namespace ctranslate2 {
         else if (input_padder)
           input_padder->add_padding(*outputs);
       }
+
+#ifdef CT2_WITH_CUDA
+      auto dp_t9 = dp_sync_now();  // End Phase I (output_norm + LM head)
+
+      if (dp_enabled && device == Device::CUDA) {
+        dp_A += dp_ms(dp_t0, dp_t1);
+        dp_B += dp_ms(dp_t1, dp_t2);
+        dp_C += dp_ms(dp_t2, dp_t3);
+        dp_D += dp_ms(dp_t3, dp_t4);
+        dp_E += dp_ms(dp_t4, dp_t5);
+        dp_F += dp_ms(dp_t5, dp_t6);
+        dp_G += dp_ms(dp_t6, dp_t7);
+        dp_H += dp_ms(dp_t7, dp_t8);
+        dp_I += dp_ms(dp_t8, dp_t9);
+        dp_total += dp_ms(dp_t_total_start, dp_t9);
+        ++dp_calls;
+
+        if (dp_calls % 500 == 0) {
+          auto pct = [&](double v) { return dp_total > 0 ? 100.0 * v / dp_total : 0.0; };
+          fprintf(stderr,
+            "[DECODE PHASE CB] calls=%zu  total=%.1fms (%.2fms/call)\n"
+            "  A offsets_cpu:    %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  B embed+scale:    %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  C pos_encoding:   %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  D layernorm_emb:  %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  E attn_mask:      %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  F memory_setup:   %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  G layer_loop:     %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  H attn_concat:    %8.1fms  %5.2fms/call  %5.1f%%\n"
+            "  I norm+lm_head:   %8.1fms  %5.2fms/call  %5.1f%%\n",
+            dp_calls, dp_total, dp_total / dp_calls,
+            dp_A, dp_A / dp_calls, pct(dp_A),
+            dp_B, dp_B / dp_calls, pct(dp_B),
+            dp_C, dp_C / dp_calls, pct(dp_C),
+            dp_D, dp_D / dp_calls, pct(dp_D),
+            dp_E, dp_E / dp_calls, pct(dp_E),
+            dp_F, dp_F / dp_calls, pct(dp_F),
+            dp_G, dp_G / dp_calls, pct(dp_G),
+            dp_H, dp_H / dp_calls, pct(dp_H),
+            dp_I, dp_I / dp_calls, pct(dp_I));
+        }
+      }
+#endif
     }
 
   }

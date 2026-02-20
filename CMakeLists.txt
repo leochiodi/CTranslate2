@@ -232,6 +232,7 @@ set(CUDA_SOURCES
   src/cuda/allocator.cc
   src/cuda/batch_copy.cu
   src/cuda/beam_select.cu
+  src/cuda/cb_ops.cu
   src/cuda/primitives.cu
   src/cuda/random.cu
   src/cuda/utils.cc

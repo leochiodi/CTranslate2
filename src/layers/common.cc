@@ -7,6 +7,10 @@
 #include "cpu/backend.h"
 #include "dispatch.h"
 
+#ifdef CT2_WITH_CUDA
+#include "cuda/cb_ops.h"
+#endif
+
 namespace ctranslate2 {
   namespace layers {
 
@@ -221,7 +225,24 @@ namespace ctranslate2 {
                                     + ", but the input has depth "
                                     + std::to_string(depth));
 
-      // Build gather indices on CPU: [batch_size * time]
+#ifdef CT2_WITH_CUDA
+      if (input.device() == Device::CUDA) {
+        // Fused GPU kernel: directly adds encodings[offsets[b]+t] to input[b,t,:].
+        // No CPU index building, no Gather, no intermediate allocation.
+        StorageView offsets_gpu(offsets_cpu.to(Device::CUDA));
+        cuda::add_position_encoding_gpu(
+            input.buffer(),
+            encodings.buffer(),
+            offsets_gpu.data<int32_t>(),
+            static_cast<int>(batch_size),
+            static_cast<int>(time),
+            static_cast<int>(depth),
+            static_cast<int>(input.item_size()));
+        return;
+      }
+#endif
+
+      // CPU fallback: Build gather indices on CPU: [batch_size * time]
       // indices[b * time + t] = offsets[b] + t
       StorageView indices({batch_size * time}, DataType::INT32);
       for (dim_t b = 0; b < batch_size; ++b) {
@@ -229,9 +250,6 @@ namespace ctranslate2 {
         for (dim_t t = 0; t < time; ++t)
           indices.at<int32_t>(b * time + t) = off + t;
       }
-
-      if (input.device() != Device::CPU)
-        indices = indices.to(input.device());
 
       // Gather position encoding rows: [batch_size * time, depth]
       StorageView pos_enc(input.dtype(), input.device());

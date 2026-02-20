@@ -13,6 +13,7 @@
 
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
+#include "cuda/cb_ops.h"
 #include "cuda/utils.h"
 #endif
 
@@ -66,31 +67,19 @@ namespace ctranslate2 {
           return;
         }
 
-        // Non-uniform positions: batch_copy_async with all copies in a single kernel.
-        // MAX_BATCH_COPIES=1024 ensures all copies fit in one launch (typ. 800 for 8 slots).
-        std::vector<cuda::CopyDescriptor> copies;
-        copies.reserve(batch * heads);
-
-        for (dim_t b = 0; b < batch; ++b) {
-          const dim_t pos = pos_cpu.at<int32_t>(b);
-          for (dim_t h = 0; h < heads; ++h) {
-            dim_t src_off, dst_off;
-            if (time_dim == 2) {
-              src_off = (b * heads + h) * 1 * d;
-              dst_off = (b * heads + h) * cache_time * d + pos * d;
-            } else {
-              src_off = b * 1 * d;
-              dst_off = b * cache_time * d + pos * d;
-            }
-            const char* src = reinterpret_cast<const char*>(step.buffer())
-                              + src_off * elem_bytes;
-            char* dst = reinterpret_cast<char*>(cache.buffer())
-                        + dst_off * elem_bytes;
-            copies.push_back({src, dst, static_cast<size_t>(d * elem_bytes)});
-          }
-        }
-
-        cuda::batch_copy_async(copies);
+        // Non-uniform positions: use fused GPU scatter kernel.
+        // Upload positions to GPU (tiny: batch * 4 bytes, e.g. 160 bytes for 40 slots).
+        // This eliminates the CPU loop that built batch*heads copy descriptors.
+        StorageView pos_gpu_sv(pos_cpu.to(Device::CUDA));
+        cuda::scatter_cache_step_gpu(
+            cache.buffer(),
+            step.buffer(),
+            pos_gpu_sv.data<int32_t>(),
+            static_cast<int>(batch),
+            static_cast<int>(heads),
+            static_cast<int>(cache_time),
+            static_cast<int>(d),
+            static_cast<int>(elem_bytes));
         return;
       }
 #endif
