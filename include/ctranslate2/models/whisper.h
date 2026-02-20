@@ -218,7 +218,8 @@ namespace ctranslate2 {
         const WhisperOptions& default_options = {},
         Device device = Device::CUDA,
         int device_index = 0,
-        ComputeType compute_type = ComputeType::DEFAULT);
+        ComputeType compute_type = ComputeType::DEFAULT,
+        size_t num_encoders = 1);
 
       ~WhisperContinuousBatcher();
 
@@ -251,6 +252,13 @@ namespace ctranslate2 {
       std::vector<std::vector<std::pair<std::string, float>>>
       detect_language(StorageView features);
 
+      // Submit a language detection request through the encoder thread (no mutex).
+      // Returns a unique request ID.
+      size_t submit_langdetect(StorageView features);
+
+      // Block until the language detection result for request_id is ready.
+      std::vector<std::pair<std::string, float>> get_langdetect_result(size_t request_id);
+
       std::vector<WhisperAlignmentResult>
       align(StorageView features,
             const std::vector<size_t>& start_sequence,
@@ -274,11 +282,12 @@ namespace ctranslate2 {
 
     private:
       std::shared_ptr<const WhisperModel> _model;
-      std::unique_ptr<layers::WhisperEncoder> _encoder;
+      std::vector<std::unique_ptr<layers::WhisperEncoder>> _encoders;
       std::unique_ptr<layers::WhisperDecoder> _decoder;
-      std::unique_ptr<layers::WhisperDecoder> _prep_decoder;  // for encoder_loop's forward_prompt
+      std::vector<std::unique_ptr<layers::WhisperDecoder>> _prep_decoders;
 
       size_t _max_slots;
+      size_t _num_encoders;
       WhisperOptions _options;
 
       size_t _sot_id;
@@ -300,10 +309,23 @@ namespace ctranslate2 {
         bool use_timestamps = true;
       };
 
+      // Language detection request type.
+      struct LangDetectRequest {
+        size_t id;
+        StorageView features;
+      };
+
       // Raw request queue (un-encoded features from submit()).
       std::queue<Request> _raw_queue;
+      // Language detection queue (shares mutex/cv with _raw_queue).
+      std::queue<LangDetectRequest> _langdetect_queue;
       mutable std::mutex _raw_queue_mutex;
       std::condition_variable _raw_queue_cv;
+
+      // Language detection results.
+      std::unordered_map<size_t, std::vector<std::pair<std::string, float>>> _langdetect_results;
+      mutable std::mutex _langdetect_results_mutex;
+      std::condition_variable _langdetect_results_cv;
 
       // Prepared request queue (encoded + forward_prompt KV caches ready).
       std::queue<Request> _encoded_queue;
@@ -312,12 +334,13 @@ namespace ctranslate2 {
 
       // Results storage.
       std::unordered_map<size_t, WhisperGenerationResult> _results;
+      std::string _worker_error;  // set on worker exception; checked in get_result()
       mutable std::mutex _results_mutex;
       std::condition_variable _results_cv;
 
-      // Encoder thread: encodes features from _raw_queue → _encoded_queue.
-      std::thread _encoder_thread;
-      // Worker thread: decodes from _encoded_queue.
+      // Encoder threads: encode features from _raw_queue → _encoded_queue.
+      std::vector<std::thread> _encoder_threads;
+      // Worker thread: single decoder from _encoded_queue.
       std::thread _worker;
       std::atomic<bool> _running{false};
       std::atomic<size_t> _next_id{0};
@@ -328,7 +351,7 @@ namespace ctranslate2 {
       std::unique_ptr<WhisperReplica> _replica;
       mutable std::mutex _replica_mutex;
 
-      void encoder_loop();
+      void encoder_loop(size_t encoder_idx);
       void worker_loop();
     };
 

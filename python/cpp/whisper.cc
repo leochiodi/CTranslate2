@@ -132,7 +132,8 @@ namespace ctranslate2 {
           float sampling_temperature,
           bool suppress_blank,
           const std::optional<std::vector<int>>& suppress_tokens,
-          size_t max_initial_timestamp_index) {
+          size_t max_initial_timestamp_index,
+          size_t num_encoders) {
         models::WhisperOptions options;
         options.beam_size = beam_size;
         options.patience = patience;
@@ -156,7 +157,8 @@ namespace ctranslate2 {
           options,
           str_to_device(device),
           device_index,
-          str_to_compute_type(compute_type));
+          str_to_compute_type(compute_type),
+          num_encoders);
       }
 
       size_t submit(const StorageView& features, Ids prompt) {
@@ -190,6 +192,15 @@ namespace ctranslate2 {
       std::vector<std::vector<std::pair<std::string, float>>>
       detect_language(const StorageView& features) {
         return _batcher->detect_language(features.sync_copy());
+      }
+
+      size_t submit_langdetect(const StorageView& features) {
+        return _batcher->submit_langdetect(features.sync_copy());
+      }
+
+      std::vector<std::pair<std::string, float>>
+      get_langdetect_result(size_t request_id) {
+        return _batcher->get_langdetect_result(request_id);
       }
 
       std::vector<models::WhisperAlignmentResult>
@@ -506,7 +517,7 @@ namespace ctranslate2 {
 
         .def(py::init<const std::string&, size_t, const std::string&, int, const std::string&,
                        size_t, float, float, float, size_t, size_t, size_t, float, bool,
-                       const std::optional<std::vector<int>>&, size_t>(),
+                       const std::optional<std::vector<int>>&, size_t, size_t>(),
              py::arg("model_path"),
              py::arg("max_slots"),
              py::arg("device")="cuda",
@@ -524,6 +535,7 @@ namespace ctranslate2 {
              py::arg("suppress_blank")=true,
              py::arg("suppress_tokens")=std::vector<int>{-1},
              py::arg("max_initial_timestamp_index")=50,
+             py::arg("num_encoders")=1,
              R"pbdoc(
                  Initializes a continuous batching Whisper engine.
 
@@ -544,6 +556,7 @@ namespace ctranslate2 {
                    suppress_blank: Suppress blank outputs at the beginning of the sampling.
                    suppress_tokens: List of token IDs to suppress.
                    max_initial_timestamp_index: Maximum index of the first predicted timestamp.
+                   num_encoders: Number of parallel encoder threads (all feed a single decoder).
              )pbdoc")
 
         .def("submit", &WhisperContinuousBatcherWrapper::submit,
@@ -630,6 +643,33 @@ namespace ctranslate2 {
                  Returns:
                    For each batch, a list of pairs (language, probability) ordered from
                    best to worst probability.
+             )pbdoc")
+
+        .def("submit_langdetect", &WhisperContinuousBatcherWrapper::submit_langdetect,
+             py::arg("features"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Submit a language detection request through the encoder thread (no mutex).
+
+                 Arguments:
+                   features: Mel spectogram of the audio, as a float array with shape
+                     ``[1, n_mels, chunk_length]``.
+
+                 Returns:
+                   A unique request ID.
+             )pbdoc")
+
+        .def("get_langdetect_result", &WhisperContinuousBatcherWrapper::get_langdetect_result,
+             py::arg("request_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Block until the language detection result for request_id is ready.
+
+                 Arguments:
+                   request_id: The ID returned by submit_langdetect.
+
+                 Returns:
+                   A list of pairs (language, probability) ordered from best to worst.
              )pbdoc")
 
         .def("align", &WhisperContinuousBatcherWrapper::align,

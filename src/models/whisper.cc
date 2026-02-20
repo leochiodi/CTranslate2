@@ -740,8 +740,10 @@ namespace ctranslate2 {
         const WhisperOptions& default_options,
         Device device,
         int device_index,
-        ComputeType compute_type)
+        ComputeType compute_type,
+        size_t num_encoders)
       : _max_slots(max_slots)
+      , _num_encoders(num_encoders < 1 ? 1 : num_encoders)
       , _options(default_options)
     {
       auto model = Model::load(model_path, device, device_index, compute_type);
@@ -750,9 +752,15 @@ namespace ctranslate2 {
         throw std::invalid_argument("The model at " + model_path + " is not a Whisper model");
 
       const auto scoped_device_setter = _model->get_scoped_device_setter();
-      _encoder = std::make_unique<layers::WhisperEncoder>(*_model, "encoder");
+
+      // Create N encoder + prep_decoder pairs for N encoder threads.
+      for (size_t i = 0; i < _num_encoders; ++i) {
+        _encoders.push_back(std::make_unique<layers::WhisperEncoder>(*_model, "encoder"));
+        _prep_decoders.push_back(std::make_unique<layers::WhisperDecoder>(*_model, "decoder"));
+      }
+
+      // Single decoder for the worker thread.
       _decoder = std::make_unique<layers::WhisperDecoder>(*_model, "decoder");
-      _prep_decoder = std::make_unique<layers::WhisperDecoder>(*_model, "decoder");
 
       const auto& vocabulary = _model->get_vocabulary();
       _sot_id = vocabulary.bos_id();
@@ -787,10 +795,15 @@ namespace ctranslate2 {
     WhisperGenerationResult WhisperContinuousBatcher::get_result(size_t request_id) {
       std::unique_lock<std::mutex> lock(_results_mutex);
       _results_cv.wait(lock, [&] {
-        return _results.count(request_id) > 0;
+        return _results.count(request_id) > 0 || !_worker_error.empty() || !_running;
       });
-      WhisperGenerationResult result = std::move(_results[request_id]);
-      _results.erase(request_id);
+      if (!_worker_error.empty())
+        throw std::runtime_error("WhisperContinuousBatcher worker error: " + _worker_error);
+      auto it = _results.find(request_id);
+      if (it == _results.end())
+        throw std::runtime_error("WhisperContinuousBatcher: stopped while waiting for result");
+      WhisperGenerationResult result = std::move(it->second);
+      _results.erase(it);
       return result;
     }
 
@@ -802,21 +815,28 @@ namespace ctranslate2 {
     void WhisperContinuousBatcher::start() {
       if (_running.exchange(true))
         return;  // Already running.
-      _encoder_thread = std::thread(&WhisperContinuousBatcher::encoder_loop, this);
+      // Launch N encoder threads.
+      _encoder_threads.resize(_num_encoders);
+      for (size_t i = 0; i < _num_encoders; ++i)
+        _encoder_threads[i] = std::thread(&WhisperContinuousBatcher::encoder_loop, this, i);
+      // Launch 1 decoder thread.
       _worker = std::thread(&WhisperContinuousBatcher::worker_loop, this);
     }
 
     void WhisperContinuousBatcher::stop() {
       if (!_running.exchange(false))
         return;  // Not running.
-      // Wake both threads so they can exit.
+      // Wake all threads so they can exit — including client threads blocked in get_result().
       _raw_queue_cv.notify_all();
       _encoded_queue_cv.notify_all();
-      if (_encoder_thread.joinable())
-        _encoder_thread.join();
+      _results_cv.notify_all();
+      _langdetect_results_cv.notify_all();
+      for (auto& t : _encoder_threads) {
+        if (t.joinable())
+          t.join();
+      }
       if (_worker.joinable())
         _worker.join();
-
     }
 
     StorageView WhisperContinuousBatcher::encode(StorageView features, bool to_cpu) {
@@ -828,6 +848,33 @@ namespace ctranslate2 {
     WhisperContinuousBatcher::detect_language(StorageView features) {
       std::lock_guard<std::mutex> lock(_replica_mutex);
       return _replica->detect_language(std::move(features));
+    }
+
+    size_t WhisperContinuousBatcher::submit_langdetect(StorageView features) {
+      const size_t id = _next_id.fetch_add(1);
+      {
+        std::lock_guard<std::mutex> lock(_raw_queue_mutex);
+        LangDetectRequest req;
+        req.id = id;
+        req.features = std::move(features);
+        _langdetect_queue.push(std::move(req));
+      }
+      _raw_queue_cv.notify_one();
+      return id;
+    }
+
+    std::vector<std::pair<std::string, float>>
+    WhisperContinuousBatcher::get_langdetect_result(size_t request_id) {
+      std::unique_lock<std::mutex> lock(_langdetect_results_mutex);
+      _langdetect_results_cv.wait(lock, [&] {
+        return _langdetect_results.count(request_id) > 0 || !_running;
+      });
+      auto it = _langdetect_results.find(request_id);
+      if (it == _langdetect_results.end())
+        throw std::runtime_error("WhisperContinuousBatcher: stopped while waiting for langdetect result");
+      auto result = std::move(it->second);
+      _langdetect_results.erase(it);
+      return result;
     }
 
     std::vector<WhisperAlignmentResult>
@@ -883,123 +930,205 @@ namespace ctranslate2 {
       return _replica->is_multilingual();
     }
 
-    void WhisperContinuousBatcher::encoder_loop() {
+    void WhisperContinuousBatcher::encoder_loop(size_t encoder_idx) {
       const auto scoped_device_setter = _model->get_scoped_device_setter();
 
 #ifdef CT2_WITH_CUDA
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
 #endif
 
+      auto& encoder = *_encoders[encoder_idx];
+      auto& prep_decoder = *_prep_decoders[encoder_idx];
+
       const Device device = _model->device();
-      const DataType dtype = _encoder->output_type();
+      const DataType dtype = encoder.output_type();
+
+      // Pre-compute language detection constants.
+      const auto& vocabulary = _model->get_vocabulary();
+      std::vector<int32_t> lang_ids;
+      for (const auto& id : _model->config["lang_ids"])
+        lang_ids.push_back(id);
+      const dim_t num_langs = static_cast<dim_t>(lang_ids.size());
 
       while (_running) {
         std::vector<Request> requests;
+        std::vector<LangDetectRequest> ld_requests;
 
         {
           std::unique_lock<std::mutex> lock(_raw_queue_mutex);
-          _raw_queue_cv.wait(lock, [&] { return !_running || !_raw_queue.empty(); });
-          if (!_running && _raw_queue.empty())
+          _raw_queue_cv.wait(lock, [&] {
+            return !_running || !_raw_queue.empty() || !_langdetect_queue.empty();
+          });
+          if (!_running && _raw_queue.empty() && _langdetect_queue.empty())
             break;
 
           // Brief batching window: wait up to 2ms to collect more requests
           // so simultaneous arrivals can be batch-encoded in a single GPU call.
-          if (_raw_queue.size() < _max_slots) {
+          const size_t total_queued = _raw_queue.size() + _langdetect_queue.size();
+          if (total_queued < _max_slots) {
             _raw_queue_cv.wait_for(lock, std::chrono::milliseconds(2),
-              [&] { return !_running || _raw_queue.size() >= _max_slots; });
+              [&] { return !_running
+                || (_raw_queue.size() + _langdetect_queue.size()) >= _max_slots; });
           }
 
           while (!_raw_queue.empty()) {
             requests.push_back(std::move(_raw_queue.front()));
             _raw_queue.pop();
           }
+          while (!_langdetect_queue.empty()) {
+            ld_requests.push_back(std::move(_langdetect_queue.front()));
+            _langdetect_queue.pop();
+          }
         }
 
-        if (requests.empty())
+        if (requests.empty() && ld_requests.empty())
           continue;
 
-        // Identify which requests need encoding.
-        std::vector<size_t> to_encode;
+        // ── Batch-encode ALL features (regular + langdetect) together ──
+        // Build a unified list of feature pointers to encode in one GPU call.
+        // Track which indices belong to langdetect vs regular requests.
+        std::vector<size_t> reg_encode_indices;   // indices into requests[]
+        std::vector<size_t> ld_encode_indices;     // indices into ld_requests[]
+        std::vector<StorageView*> all_to_encode;   // pointers for batch encoding
+
         for (size_t i = 0; i < requests.size(); ++i) {
-          if (!_encoder->is_encoded(requests[i].features))
-            to_encode.push_back(i);
+          if (!encoder.is_encoded(requests[i].features)) {
+            reg_encode_indices.push_back(i);
+            requests[i].features.move_to(device, dtype);
+            all_to_encode.push_back(&requests[i].features);
+          }
+        }
+        for (size_t i = 0; i < ld_requests.size(); ++i) {
+          ld_encode_indices.push_back(i);
+          ld_requests[i].features.move_to(device, dtype);
+          all_to_encode.push_back(&ld_requests[i].features);
         }
 
-        if (!to_encode.empty()) {
-          // Move features to device/dtype.
-          for (const size_t idx : to_encode)
-            requests[idx].features.move_to(device, dtype);
-
-          if (to_encode.size() == 1) {
-            // Single request: encode directly, no concat/split overhead.
+        if (!all_to_encode.empty()) {
+          if (all_to_encode.size() == 1) {
             StorageView encoded(dtype, device);
-            (*_encoder)(requests[to_encode[0]].features, encoded);
-            requests[to_encode[0]].features = std::move(encoded);
+            encoder(*all_to_encode[0], encoded);
+            *all_to_encode[0] = std::move(encoded);
           } else {
-            // Batch-encode: concat along batch dim, single encoder call, split back.
-            std::vector<const StorageView*> feature_ptrs;
-            feature_ptrs.reserve(to_encode.size());
-            for (const size_t idx : to_encode)
-              feature_ptrs.push_back(&requests[idx].features);
-
+            std::vector<const StorageView*> feature_ptrs(
+              all_to_encode.begin(), all_to_encode.end());
             StorageView batch_features(dtype, device);
             ops::Concat(0)(feature_ptrs, batch_features);
 
             StorageView batch_encoded(dtype, device);
-            (*_encoder)(batch_features, batch_encoded);
+            encoder(batch_features, batch_encoded);
 
-            // Split back into individual [1, T, D] results.
-            for (size_t i = 0; i < to_encode.size(); ++i) {
+            for (size_t i = 0; i < all_to_encode.size(); ++i) {
               StorageView indices({1}, static_cast<int32_t>(i));
               if (device != Device::CPU)
                 indices = indices.to(device);
               StorageView single(dtype, device);
               ops::Gather(0)(batch_encoded, indices, single);
-              requests[to_encode[i]].features = std::move(single);
+              *all_to_encode[i] = std::move(single);
             }
           }
         }
 
-        // Run forward_prompt for each request to pre-compute KV caches.
-        // This runs on the encoder thread's CUDA stream, overlapping with
-        // the worker thread's decode loop on its own stream.
-        for (auto& req : requests) {
-          const size_t pl = get_prompt_length(req.prompt, _sot_id, _no_timestamps_id);
-          req.use_timestamps = std::find(req.prompt.begin(), req.prompt.end(),
-                                          _no_timestamps_id) == req.prompt.end();
+        // ── Process language detection requests ──
+        // Run a single batched decoder step to get language logits for all ld_requests.
+        if (!ld_requests.empty()) {
+          const dim_t ld_batch = static_cast<dim_t>(ld_requests.size());
 
-          std::vector<size_t> prompt_tokens;
-          if (pl <= 1) {
-            req.start_tokens = std::move(req.prompt);
+          // Stack encoded features into [N, T, D].
+          StorageView ld_memory(dtype, device);
+          if (ld_batch == 1) {
+            ld_memory = std::move(ld_requests[0].features);
           } else {
-            prompt_tokens.assign(req.prompt.begin(), req.prompt.begin() + pl - 1);
-            req.start_tokens.assign(req.prompt.begin() + pl - 1, req.prompt.end());
+            std::vector<const StorageView*> mem_ptrs;
+            mem_ptrs.reserve(ld_batch);
+            for (auto& lr : ld_requests)
+              mem_ptrs.push_back(&lr.features);
+            ops::Concat(0)(mem_ptrs, ld_memory);
           }
 
-          req.prepared_state = _prep_decoder->initial_state(/*iterative_decoding=*/true);
-          req.prepared_state["memory"] = std::move(req.features);
-          req.prepared_state["_retain_memory"] = StorageView();
+          // Prepare decoder state and inputs.
+          StorageView start_ids({ld_batch}, static_cast<int32_t>(_sot_id), device);
+          StorageView score_ids({ld_batch, num_langs}, DataType::INT32);
+          for (dim_t i = 0; i < ld_batch; ++i)
+            for (dim_t j = 0; j < num_langs; ++j)
+              score_ids.at<int32_t>({i, j}) = lang_ids[j];
+          if (score_ids.device() != device)
+            score_ids = score_ids.to(device);
 
-          if (!prompt_tokens.empty()) {
-            StorageView input_ids = layers::make_sequence_inputs(
-              {prompt_tokens}, device);
-            _prep_decoder->forward_prompt(input_ids, req.prepared_state);
+          layers::DecoderState ld_state = prep_decoder.initial_state();
+          ld_state.emplace("memory", std::move(ld_memory));
+
+          StorageView logits(prep_decoder.output_type(), device);
+          StorageView lang_probs(logits.dtype(), device);
+          prep_decoder(0, start_ids, ld_state, &logits);
+          ops::Gather(/*axis=*/-1, /*batch_dims=*/1)(logits, score_ids, lang_probs);
+          ops::SoftMax()(lang_probs);
+
+          if (lang_probs.dtype() != DataType::FLOAT32)
+            lang_probs = lang_probs.to_float32();
+          if (lang_probs.device() != Device::CPU)
+            lang_probs = lang_probs.to(Device::CPU);
+
+          // Store results and notify waiters.
+          {
+            std::lock_guard<std::mutex> lock(_langdetect_results_mutex);
+            for (dim_t i = 0; i < ld_batch; ++i) {
+              std::vector<std::pair<std::string, float>> result;
+              result.reserve(num_langs);
+              for (dim_t j = 0; j < num_langs; ++j) {
+                result.emplace_back(
+                  vocabulary.to_token(lang_ids[j]),
+                  lang_probs.at<float>({i, j}));
+              }
+              std::sort(result.begin(), result.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+              _langdetect_results[ld_requests[i].id] = std::move(result);
+            }
+          }
+          _langdetect_results_cv.notify_all();
+        }
+
+        // ── Process regular transcription requests ──
+        if (!requests.empty()) {
+          // Run forward_prompt for each request to pre-compute KV caches.
+          for (auto& req : requests) {
+            const size_t pl = get_prompt_length(req.prompt, _sot_id, _no_timestamps_id);
+            req.use_timestamps = std::find(req.prompt.begin(), req.prompt.end(),
+                                            _no_timestamps_id) == req.prompt.end();
+
+            std::vector<size_t> prompt_tokens;
+            if (pl <= 1) {
+              req.start_tokens = std::move(req.prompt);
+            } else {
+              prompt_tokens.assign(req.prompt.begin(), req.prompt.begin() + pl - 1);
+              req.start_tokens.assign(req.prompt.begin() + pl - 1, req.prompt.end());
+            }
+
+            req.prepared_state = prep_decoder.initial_state(/*iterative_decoding=*/true);
+            req.prepared_state["memory"] = std::move(req.features);
+            req.prepared_state["_retain_memory"] = StorageView();
+
+            if (!prompt_tokens.empty()) {
+              StorageView input_ids = layers::make_sequence_inputs(
+                {prompt_tokens}, device);
+              prep_decoder.forward_prompt(input_ids, req.prepared_state);
+            }
+
+            req.prepared_state.erase("_retain_memory");
+            req.prompt_length = static_cast<dim_t>(prompt_tokens.size());
           }
 
-          req.prepared_state.erase("_retain_memory");
-          req.prompt_length = static_cast<dim_t>(prompt_tokens.size());
-        }
+          // Ensure GPU writes are visible to the worker thread's stream.
+          synchronize_stream(device);
 
-        // Ensure GPU writes are visible to the worker thread's stream.
-        synchronize_stream(device);
-
-        // Push prepared requests to the encoded queue.
-        {
-          std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
-          for (auto& req : requests)
-            _encoded_queue.push(std::move(req));
+          // Push prepared requests to the encoded queue.
+          {
+            std::lock_guard<std::mutex> lock(_encoded_queue_mutex);
+            for (auto& req : requests)
+              _encoded_queue.push(std::move(req));
+          }
+          _encoded_queue_cv.notify_all();
         }
-        _encoded_queue_cv.notify_all();
       }
     }
 
@@ -1139,20 +1268,28 @@ namespace ctranslate2 {
 
         // Process the batch. queue_provider allows mid-decode slot filling.
         // Results are delivered incrementally via callback as each slot completes.
-        engine.process(local_queue, queue_provider,
-          [this, &vocabulary](ContinuousResult cr) {
-            WhisperGenerationResult wr;
-            wr.sequences = vocabulary.to_tokens(cr.result.hypotheses);
-            wr.sequences_ids = std::move(cr.result.hypotheses);
-            wr.scores = std::move(cr.result.scores);
-            if (cr.attention_weights)
-              wr.attention_weights = std::move(cr.attention_weights);
-            {
-              std::lock_guard<std::mutex> lock(_results_mutex);
-              _results[cr.request_id] = std::move(wr);
-            }
-            _results_cv.notify_all();
-          });
+        try {
+          engine.process(local_queue, queue_provider,
+            [this, &vocabulary](ContinuousResult cr) {
+              WhisperGenerationResult wr;
+              wr.sequences = vocabulary.to_tokens(cr.result.hypotheses);
+              wr.sequences_ids = std::move(cr.result.hypotheses);
+              wr.scores = std::move(cr.result.scores);
+              if (cr.attention_weights)
+                wr.attention_weights = std::move(cr.attention_weights);
+              {
+                std::lock_guard<std::mutex> lock(_results_mutex);
+                _results[cr.request_id] = std::move(wr);
+              }
+              _results_cv.notify_all();
+            });
+        } catch (const std::exception& e) {
+          // Surface the error to any client threads waiting in get_result().
+          // This prevents a single bad batch from crashing the whole server.
+          std::lock_guard<std::mutex> lock(_results_mutex);
+          _worker_error = std::string(e.what());
+          _results_cv.notify_all();
+        }
       }
 
       // Synchronize CUDA stream before local objects (engine, tensors) are destroyed,
