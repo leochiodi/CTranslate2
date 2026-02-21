@@ -9,6 +9,7 @@
 
 #ifdef CT2_WITH_CUDA
 #include "cuda/cb_ops.h"
+#include "cuda/cuda_graph.h"
 #endif
 
 namespace ctranslate2 {
@@ -187,6 +188,34 @@ namespace ctranslate2 {
       const dim_t batch_size = input.dim(0);
       const dim_t time = input.dim(1);
       const dim_t depth = input.dim(-1);
+
+#ifdef CT2_WITH_CUDA
+      // CUDA graph capture: skip CPU uniform check, use GPU kernel directly.
+      // The uniform fast-path uses a CPU-computed pointer offset that gets baked
+      // into the graph; on replay it would use the stale offset. The GPU kernel
+      // reads offsets from a GPU buffer whose content is updated each step.
+      if (cuda::g_cuda_graph_capturing && input.device() == Device::CUDA) {
+        // Encoding table was already expanded by prior non-graph steps.
+        const StorageView& encodings = get_position_encoding(1);
+        const int32_t* offsets_gpu;
+        StorageView offsets_tmp;
+        if (offsets.device() == Device::CUDA) {
+          offsets_gpu = offsets.data<int32_t>();
+        } else {
+          offsets_tmp = offsets.to(Device::CUDA);
+          offsets_gpu = offsets_tmp.data<int32_t>();
+        }
+        cuda::add_position_encoding_gpu(
+            input.buffer(),
+            encodings.buffer(),
+            offsets_gpu,
+            static_cast<int>(batch_size),
+            static_cast<int>(time),
+            static_cast<int>(depth),
+            static_cast<int>(input.item_size()));
+        return;
+      }
+#endif
 
       // Read offsets on CPU to build gather indices and find max position.
       StorageView offsets_cpu(DataType::INT32);

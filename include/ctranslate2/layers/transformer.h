@@ -242,6 +242,17 @@ namespace ctranslate2 {
       Dense _proj;
       const dim_t _sliding_window;
       const bool _tensor_parallel;
+
+      // Pre-allocated decode scratch buffers for CB path (CUDA graph support).
+      // Eliminates per-step StorageView allocations so addresses stay stable.
+      struct CbDecodeBuffers {
+        StorageView buf[2];        // Ping-pong layer I/O: [total_batch, 1, d_model]
+        StorageView attn_lengths;  // [total_batch], INT32
+        StorageView position_bias; // Empty (reused across steps)
+        dim_t allocated_batch = 0;
+      };
+      CbDecodeBuffers _cb_buffers;
+      void ensure_cb_buffers(dim_t total_batch, DataType dtype, Device device);
     };
 
   }

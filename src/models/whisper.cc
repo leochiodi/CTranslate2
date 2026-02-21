@@ -7,6 +7,7 @@
 #include "ctranslate2/decoding.h"
 #include "ctranslate2/ops/ops.h"
 #include "ctranslate2/sampling.h"
+#include "ctranslate2/utils.h"
 
 #include "dispatch.h"
 #include "dtw.h"
@@ -1116,6 +1117,29 @@ namespace ctranslate2 {
 
             req.prepared_state.erase("_retain_memory");
             req.prompt_length = static_cast<dim_t>(prompt_tokens.size());
+
+            // Step 7: Pre-stage beam replication on encoder thread.
+            // Tile self-KV caches from [1, H, T, D] to [beam_size, H, T, D].
+            // This moves ~64 GPU Tile kernel launches off the decoder hot path.
+            // Memory* tensors are slot-level and must NOT be replicated.
+            const dim_t beam_size = static_cast<dim_t>(_options.beam_size);
+            if (beam_size > 1) {
+              for (auto& [name, value] : req.prepared_state) {
+                if (!value)
+                  continue;
+                if (starts_with(name, "memory"))
+                  continue;
+                if (value.dim(0) == 1) {
+                  value.expand_dims(1);
+                  ops::Tile(1, beam_size)(value);
+                  Shape shape = value.shape();
+                  shape[0] = beam_size;
+                  shape.erase(shape.begin() + 1);
+                  value.reshape(std::move(shape));
+                }
+              }
+              req.beam_replicated = true;
+            }
           }
 
           // Ensure GPU writes are visible to the worker thread's stream.
@@ -1227,6 +1251,7 @@ namespace ctranslate2 {
         cr.prompt_length = req.prompt_length;
         cr.start_tokens = std::move(req.start_tokens);
         cr.use_timestamps = req.use_timestamps;
+        cr.beam_replicated = req.beam_replicated;
         return cr;
       };
 

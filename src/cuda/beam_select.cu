@@ -55,7 +55,7 @@ __global__ void beam_select_kernel(
   for (int k = 0; k < num_candidates && filled < beam_size; ++k) {
     const int flat_id = topk_ids[slot * num_candidates + k];
     const float score = topk_scores[slot * num_candidates + k];
-    const int beam_id = flat_id / vocab_size;
+    const int beam_id = min(flat_id / vocab_size, beam_size - 1);
     const int word_id = flat_id % vocab_size;
 
     bool is_eos = false;
@@ -147,12 +147,13 @@ void beam_select_async(
     int32_t max_length,
     int32_t max_candidates,
     float length_penalty,
-    int32_t num_end_ids)
+    int32_t num_end_ids,
+    cudaStream_t stream)
 {
   if (active_count <= 0)
     return;
 
-  beam_select_kernel<<<active_count, 1>>>(
+  beam_select_kernel<<<active_count, 1, 0, stream>>>(
       topk_ids, topk_scores,
       beam_scores_in, beam_finished_in,
       num_finished_in, steps, prompt_lengths, end_ids,

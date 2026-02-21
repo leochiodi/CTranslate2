@@ -39,7 +39,8 @@ void beam_select_async(
     int32_t max_length,
     int32_t max_candidates,
     float length_penalty,
-    int32_t num_end_ids);
+    int32_t num_end_ids,
+    cudaStream_t stream = 0);
 
 // Fill out[0..n-1] = 0, 1, ..., n-1 asynchronously on the given stream.
 void fill_identity_async(int32_t* out, int32_t n, cudaStream_t stream = 0);

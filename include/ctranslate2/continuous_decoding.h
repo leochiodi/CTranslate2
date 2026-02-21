@@ -23,6 +23,7 @@ namespace ctranslate2 {
     dim_t prompt_length = 0;
     std::vector<size_t> start_tokens;     // tokens to start autoregressive decode
     bool use_timestamps = true;           // whether timestamp rules apply to this request
+    bool beam_replicated = false;         // true if self-KV caches already tiled to beam_size
   };
 
   // Result from a completed slot.

@@ -307,6 +307,7 @@ namespace ctranslate2 {
         dim_t prompt_length = 0;
         std::vector<size_t> start_tokens;
         bool use_timestamps = true;
+        bool beam_replicated = false;
       };
 
       // Language detection request type.

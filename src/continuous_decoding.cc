@@ -15,6 +15,8 @@
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
 #include "cuda/beam_select.h"
+#include "cuda/cb_ops.h"
+#include "cuda/cuda_graph.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -177,17 +179,54 @@ namespace ctranslate2 {
       StorageView log_probs(logits.dtype(), logits.device());
       ops::LogSoftMax()(logits, log_probs);
 
-      for (const dim_t row : check_timestamps_prob_rows) {
-        bool sample_ts = false;
+#ifdef CT2_WITH_CUDA
+      if (log_probs.device() == Device::CUDA) {
+        const dim_t num_rows = check_timestamps_prob_rows.size();
 
-        DEVICE_AND_FLOAT_DISPATCH(
-          "ContinuousTimestampRules", log_probs.device(), log_probs.dtype(),
-          (sample_ts = should_sample_timestamp<D, T>(
-            log_probs, row, _timestamp_begin_id, _timestamp_end_id)));
+        // Upload row indices to GPU (single H2D).
+        std::vector<int32_t> row_idx_cpu(num_rows);
+        for (dim_t i = 0; i < num_rows; ++i)
+          row_idx_cpu[i] = static_cast<int32_t>(check_timestamps_prob_rows[i]);
+        StorageView row_indices_gpu({num_rows}, row_idx_cpu, Device::CUDA);
 
-        if (sample_ts) {
-          for (size_t i = 0; i < _timestamp_begin_id; ++i)
-            disable_tokens.add(row, i);
+        // Allocate result buffer on GPU.
+        StorageView results_gpu({num_rows}, DataType::INT32, Device::CUDA);
+
+        // Single kernel launch replaces N × 3 GPU syncs.
+        cuda::batch_timestamp_check_gpu(
+            log_probs.buffer(),
+            row_indices_gpu.data<int32_t>(),
+            static_cast<int>(num_rows),
+            static_cast<int>(log_probs.dim(-1)),
+            static_cast<int>(_timestamp_begin_id),
+            static_cast<int>(_timestamp_end_id - _timestamp_begin_id + 1),
+            results_gpu.data<int32_t>(),
+            log_probs.item_size());
+
+        // Single D2H copy for all results.
+        StorageView results_cpu = results_gpu.to(Device::CPU);
+
+        for (dim_t i = 0; i < num_rows; ++i) {
+          if (results_cpu.at<int32_t>(i)) {
+            const dim_t row = check_timestamps_prob_rows[i];
+            for (size_t t = 0; t < _timestamp_begin_id; ++t)
+              disable_tokens.add(row, t);
+          }
+        }
+      } else
+#endif
+      {
+        // CPU fallback: keep original per-row logic.
+        for (const dim_t row : check_timestamps_prob_rows) {
+          bool sample_ts = false;
+          DEVICE_AND_FLOAT_DISPATCH(
+            "ContinuousTimestampRules", log_probs.device(), log_probs.dtype(),
+            (sample_ts = should_sample_timestamp<D, T>(
+              log_probs, row, _timestamp_begin_id, _timestamp_end_id)));
+          if (sample_ts) {
+            for (size_t i = 0; i < _timestamp_begin_id; ++i)
+              disable_tokens.add(row, i);
+          }
         }
       }
     }
@@ -274,8 +313,6 @@ namespace ctranslate2 {
     for (auto& [name, batch_value] : batch_state) {
       if (name.find("_retain_memory") != std::string::npos)
         continue;
-      if (name == "cache_lengths")
-        continue;
 
       const auto it = single_state.find(name);
       if (it == single_state.end())
@@ -358,10 +395,12 @@ namespace ctranslate2 {
     // Use the pre-prepared state from encoder_loop (encode + forward_prompt already done).
     layers::DecoderState single_state = std::move(request.prepared_state);
     const dim_t prompt_length = request.prompt_length;
+    const bool beam_replicated = request.beam_replicated;
 
     // For beam search: replicate the single-element state beam_size times.
     // Skip memory* tensors — they stay at slot-level (one per request).
-    if (_beam_size > 1) {
+    // Skip if already pre-staged on the encoder thread (Step 7).
+    if (_beam_size > 1 && !beam_replicated) {
       for (auto& [name, value] : single_state) {
         if (!value || name.find("_retain_memory") != std::string::npos)
           continue;
@@ -414,14 +453,27 @@ namespace ctranslate2 {
       }
 
       batch_state = std::move(single_state);
-      batch_state["cache_lengths"] = StorageView({total_batch}, int32_t(0));  // CPU: avoid GPU sync roundtrips
+      batch_state["cache_lengths"] = StorageView({total_batch}, int32_t(1), device);
     }
 
-    // Update cache_lengths for this slot's rows (always on CPU).
+    // Update cache_lengths for this slot's rows.
     auto& cache_lengths = batch_state["cache_lengths"];
     if (cache_lengths) {
-      for (dim_t b = 0; b < _beam_size; ++b)
-        cache_lengths.at<int32_t>(slot_idx * _beam_size + b) = prompt_length;
+      const dim_t offset = static_cast<dim_t>(slot_idx) * _beam_size;
+#ifdef CT2_WITH_CUDA
+      if (cache_lengths.device() == Device::CUDA) {
+        // H2D memcpy for beam_size elements.
+        std::vector<int32_t> cl_vals(_beam_size, prompt_length);
+        cudaMemcpyAsync(cache_lengths.data<int32_t>() + offset,
+                        cl_vals.data(),
+                        _beam_size * sizeof(int32_t),
+                        cudaMemcpyHostToDevice);
+      } else
+#endif
+      {
+        for (dim_t b = 0; b < _beam_size; ++b)
+          cache_lengths.at<int32_t>(offset + b) = prompt_length;
+      }
     }
 
     // Set slot state.
@@ -461,7 +513,7 @@ namespace ctranslate2 {
         continue;
       if (name.find("_retain_memory") != std::string::npos)
         continue;
-      if (name == "cache_lengths" || name == "accumulated_attention")
+      if (name == "accumulated_attention")
         continue;
 
       const bool is_mem = starts_with(name, "memory");
@@ -494,9 +546,6 @@ namespace ctranslate2 {
         continue;
       if (name.find("_retain_memory") != std::string::npos)
         continue;
-      // cache_lengths is on CPU, handled separately below.
-      if (name == "cache_lengths")
-        continue;
 
       const bool is_mem = starts_with(name, "memory");
       const dim_t rows_per_slot = is_mem ? 1 : _beam_size;
@@ -523,17 +572,6 @@ namespace ctranslate2 {
         primitives<D>::copy(value.data<T>() + src_offset,
                             value.data<T>() + dst_offset,
                             copy_elems));
-    }
-
-    // Copy cache_lengths entries (CPU tensor).
-    {
-      auto& cl = batch_state["cache_lengths"];
-      if (cl) {
-        for (dim_t b = 0; b < _beam_size; ++b) {
-          cl.at<int32_t>(static_cast<dim_t>(dst_slot) * _beam_size + b) =
-            cl.at<int32_t>(static_cast<dim_t>(src_slot) * _beam_size + b);
-        }
-      }
     }
 
 #ifdef CT2_WITH_CUDA
@@ -707,13 +745,18 @@ namespace ctranslate2 {
     }
 
     // Set cache_lengths (build on CPU, then move to device).
+    // GPU-resident cache_lengths eliminates per-step CPU rebuild loops.
+    // Inactive rows get cache_lengths=1 (NOT 0) to avoid all-masked softmax NaN.
     {
-      StorageView cl_cpu({total_batch}, int32_t(0));
+      StorageView cl_cpu({total_batch}, int32_t(1));
       for (size_t s = 0; s < initial_slots.size(); ++s) {
         for (dim_t b = 0; b < _beam_size; ++b)
           cl_cpu.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = initial_slots[s].prompt_length;
       }
-      batch_state["cache_lengths"] = std::move(cl_cpu);  // Keep on CPU to avoid GPU sync roundtrips
+      if (device != Device::CPU)
+        batch_state["cache_lengths"] = cl_cpu.to(device);
+      else
+        batch_state["cache_lengths"] = std::move(cl_cpu);
     }
 
     // Set slot states.
@@ -745,6 +788,12 @@ namespace ctranslate2 {
     if (active_count == 0)
       return;
 
+    // CPU shadow for cache_lengths: one value per slot (all beams share the same length).
+    // Used for concat/scatter decision, min_step, and pad computation — avoids GPU→CPU sync.
+    std::vector<int32_t> slot_cache_lengths(_max_slots, 0);
+    for (size_t s = 0; s < initial_slots.size(); ++s)
+      slot_cache_lengths[s] = initial_slots[s].prompt_length;
+
     // Build sample_from for ALL batch rows (always total_batch elements).
     StorageView sample_from({total_batch}, DataType::INT32);
     for (size_t s = 0; s < _max_slots; ++s) {
@@ -754,7 +803,9 @@ namespace ctranslate2 {
       }
     }
 
-    StorageView logits(dtype, device);
+    // Pre-allocate logits for stable GPU address (CUDA graph support).
+    const dim_t vocab_size = _decoder.output_size();
+    StorageView logits({total_batch, vocab_size}, dtype, device);
     StorageView best_ids(DataType::INT32);
     StorageView best_probs(dtype);
 
@@ -901,11 +952,20 @@ namespace ctranslate2 {
     StorageView full_gather_persistent;
     StorageView gpu_topk_scores;
     StorageView gpu_topk_ids;
+    StorageView beam_scores_cast_persistent;   // [total_batch] in logits dtype
+    StorageView topk_scores_f32_persistent;    // [max_slots, 2*beam_size] FLOAT32
     if (use_gpu_beam_pipeline) {
       full_gather_persistent = StorageView({total_batch}, DataType::INT32, device);
-      // TopK output buffers on GPU — dtype set on first use, shape reused after.
-      gpu_topk_scores = StorageView(DataType::FLOAT32, device);
-      gpu_topk_ids = StorageView(DataType::INT32, device);
+      // Pre-allocate at max_slots size so resize() inside TopK is a no-op during capture.
+      gpu_topk_scores = StorageView(
+          {static_cast<dim_t>(_max_slots), 2 * _beam_size}, dtype, device);
+      gpu_topk_ids = StorageView(
+          {static_cast<dim_t>(_max_slots), 2 * _beam_size}, DataType::INT32, device);
+      // Persistent buffer for beam_scores cast to logits dtype (avoids alloc per step).
+      beam_scores_cast_persistent = StorageView({total_batch}, dtype, device);
+      // Persistent buffer for topk_scores float32 conversion (avoids alloc per step).
+      topk_scores_f32_persistent = StorageView(
+          {static_cast<dim_t>(_max_slots), 2 * _beam_size}, DataType::FLOAT32, device);
     }
 #else
     (void)use_gpu_beam_pipeline;
@@ -922,7 +982,7 @@ namespace ctranslate2 {
     // --- Step-level timing instrumentation ---
     using Clock = std::chrono::high_resolution_clock;
     double t_slot_mgmt = 0, t_cache_pad = 0, t_step_setup = 0;
-    double t_decoder = 0, t_attn_accum = 0, t_logits_proc = 0, t_selection = 0;
+    double t_decoder = 0, t_attn_accum = 0, t_phase_b = 0, t_logits_proc = 0, t_selection = 0;
     double t_resize_up = 0, t_defrag = 0, t_fill = 0, t_rebuild = 0;
     size_t step_count = 0;
     auto t_loop_start = Clock::now();
@@ -930,6 +990,19 @@ namespace ctranslate2 {
     auto elapsed_ms = [](Clock::time_point a, Clock::time_point b) {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
+
+    // Step 3: Deferred fill state — fill every K steps (adaptive K=1-4).
+    size_t steps_since_fill = 0;
+    size_t fill_interval = 1;  // Start aggressive, ramp up when queue is empty.
+
+    // Step 5: CUDA Graph for decoder forward — eliminates ~500-600 kernel launch overhead.
+    // Step 6: Second CUDA Graph for Phase C beam search pipeline.
+#ifdef CT2_WITH_CUDA
+    cuda::CudaGraphWrapper cuda_graph;       // Graph 1: decoder forward
+    cuda::CudaGraphWrapper cuda_graph_beam;  // Graph 2: Phase C beam search
+    static const bool no_cuda_graph = std::getenv("CT2_NO_CUDA_GRAPH") != nullptr;
+    bool graph_structural_change = true;  // Force non-graph first step.
+#endif
 
     // Main decode loop.
     while (true) {
@@ -955,16 +1028,15 @@ namespace ctranslate2 {
       // --- Determine concat vs scatter path (at MAX size, before resize) ---
       // Concat path is only allowed when ALL slots are active (active_count == max_slots)
       // because concat creates new allocations that would break the over-allocate invariant.
+      // Uses CPU shadow (slot_cache_lengths) to avoid GPU→CPU sync.
       bool use_concat_path = false;
       {
-        const auto& cache_lengths = batch_state["cache_lengths"];
         const dim_t current_cache_time = max_cache_length(batch_state);
 
         bool uniform_cache = true;
         int32_t common_cl = -1;
         for (size_t s = 0; s < active_count; ++s) {
-          int32_t cl = cache_lengths.at<int32_t>(
-            static_cast<dim_t>(s) * _beam_size);
+          int32_t cl = slot_cache_lengths[s];
           if (common_cl < 0)
             common_cl = cl;
           else if (cl != common_cl) {
@@ -983,8 +1055,8 @@ namespace ctranslate2 {
         // happen before we resize the tensors down.
         if (!use_concat_path) {
           dim_t max_cl = 0;
-          for (dim_t i = 0; i < active_batch; ++i)
-            max_cl = std::max(max_cl, dim_t(cache_lengths.at<int32_t>(i)));
+          for (size_t s = 0; s < active_count; ++s)
+            max_cl = std::max(max_cl, dim_t(slot_cache_lengths[s]));
 
           if (max_cl >= current_cache_time) {
             constexpr dim_t chunk_size = 64;
@@ -997,6 +1069,10 @@ namespace ctranslate2 {
                 pad_cache(value, target, /*time_dim=*/2);
               }
             }
+#ifdef CT2_WITH_CUDA
+            // Cache tensors reallocated → GPU addresses changed → invalidate graph.
+            graph_structural_change = true;
+#endif
           }
         }
       }
@@ -1004,32 +1080,27 @@ namespace ctranslate2 {
       auto t2 = Clock::now();
       t_cache_pad += elapsed_ms(t1, t2);
 
-      // --- Resize batch_state DOWN to active dimensions ---
-      // StorageView::resize() to a smaller dim(0) is free (no reallocation).
-      if (active_count < _max_slots)
-        resize_batch_state(batch_state, static_cast<dim_t>(active_count));
+      // --- Step 2: No resize — always run decoder on total_batch rows ---
+      // Inactive rows have cache_lengths=1 (safe: attend to position 0 of zero-padded cache,
+      // producing zero context → zero output through all layers).
+      // step_offsets_device = cache_lengths (GPU), total_batch sized.
+      StorageView& step_offsets_device = batch_state["cache_lengths"];
 
-      // Build step_offsets for active batch rows only (on CPU).
-      // For GPU pipeline: on iteration 2+, slot.step hasn't been confirmed yet (Phase B
-      // hasn't run), so we use the speculative step (slot.step + 1).
-      step_offsets.resize({active_batch});
-      for (size_t s = 0; s < active_count; ++s) {
-        int32_t step_val = slots[s].step;
-#ifdef CT2_WITH_CUDA
-        if (use_gpu_beam_pipeline && pending_beam_sync)
-          step_val += 1;  // Speculative: Phase B will confirm slot.step++ later.
-#endif
+      // Compute min_step from CPU shadow and store for transformer.cc.
+      dim_t min_step = slot_cache_lengths[0];
+      for (size_t s = 1; s < active_count; ++s)
+        min_step = std::min(min_step, dim_t(slot_cache_lengths[s]));
+      batch_state["min_step"] = StorageView({1}, int32_t(min_step));
+
+      // Build CPU step_offsets for transformer.cc position encoder.
+      // Total_batch sized: active slots get real values, inactive get 1 (safe dummy).
+      step_offsets.resize({total_batch});
+      for (size_t s = 0; s < _max_slots; ++s) {
+        const int32_t step_val = (s < active_count) ? slot_cache_lengths[s] : 1;
         for (dim_t b = 0; b < _beam_size; ++b)
           step_offsets.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = step_val;
       }
-
-      // Store CPU step_offsets in batch_state so transformer.cc can skip GPU→CPU copy.
       batch_state["step_offsets_cpu"] = step_offsets;
-
-      // Create GPU copy for the decode step.
-      StorageView step_offsets_device(step_offsets);
-      if (device != Device::CPU)
-        step_offsets_device = step_offsets_device.to(device);
 
       // Set concat/scatter flags in batch_state.
       if (use_concat_path) {
@@ -1037,63 +1108,74 @@ namespace ctranslate2 {
       } else {
         batch_state.erase("no_self_attn_mask");
 
-        // Scatter path: set write positions for active rows only.
-        const auto& cache_lengths = batch_state["cache_lengths"];
-        StorageView active_write_pos({active_batch}, DataType::INT32);
-        for (dim_t i = 0; i < active_batch; ++i)
-          active_write_pos.at<int32_t>(i) = cache_lengths.at<int32_t>(i);
-        batch_state["cache_write_positions"] = std::move(active_write_pos);
+        // Scatter path: cache_lengths (GPU, total_batch) IS the write positions.
+        // Inactive rows have cache_lengths=1, writing to position 1 (harmless overwrite).
+        batch_state["cache_write_positions"].shallow_copy(batch_state["cache_lengths"]);
       }
 
-      // Build active sample_from for the decoder.
-      StorageView active_sample_from_device(DataType::INT32, device);
+      // Build sample_from for the decoder (total_batch sized).
+      StorageView full_sample_from_device(DataType::INT32, device);
 #ifdef CT2_WITH_CUDA
       if (use_gpu_beam_pipeline) {
-        // Use GPU-resident sample_from directly (already on device, active rows at front).
-        auto& bs_sample = batch_state["_bs_sample_from"];
-        // Wrap the active portion as a view — but StorageView doesn't support sub-views,
-        // so we create a new StorageView and D2D copy the active portion.
-        active_sample_from_device.resize({active_batch});
-        cudaMemcpyAsync(active_sample_from_device.data<int32_t>(),
-                        bs_sample.data<int32_t>(),
-                        active_batch * sizeof(int32_t),
-                        cudaMemcpyDeviceToDevice);
-
+        // Use GPU-resident sample_from directly (total_batch sized).
+        full_sample_from_device.shallow_copy(batch_state["_bs_sample_from"]);
       } else
 #endif
       {
-        StorageView active_sample_from({active_batch}, DataType::INT32);
-        for (dim_t i = 0; i < active_batch; ++i)
-          active_sample_from.at<int32_t>(i) = sample_from.at<int32_t>(i);
-        active_sample_from_device = active_sample_from.to(device);
-
+        full_sample_from_device = sample_from.to(device);
       }
 
       // Debug: dump sample_from tokens for first slot's beams before decoder.
       if (debug_defrag && active_count > 0) {
-        StorageView sf_cpu = active_sample_from_device.to(Device::CPU);
+        StorageView sf_cpu = full_sample_from_device.to(Device::CPU);
         fprintf(stderr, "[STEP] step=%d sample_from=[", (int)slots[0].step);
         for (dim_t b = 0; b < _beam_size && b < sf_cpu.size(); ++b)
           fprintf(stderr, "%s%d", b?",":"", sf_cpu.at<int32_t>(b));
         fprintf(stderr, "] step_off=%d gpu=%d\n",
-                step_offsets.at<int32_t>(0), use_gpu_beam_pipeline ? 1 : 0);
+                (int)slot_cache_lengths[0], use_gpu_beam_pipeline ? 1 : 0);
       }
 
       auto t3 = Clock::now();
       t_step_setup += elapsed_ms(t2, t3);
 
       StorageView step_attention(device);
-      _decoder(step_offsets_device, active_sample_from_device, batch_state, &logits,
+
+#ifdef CT2_WITH_CUDA
+      // CUDA Graph: capture decoder forward on first steady-state step, replay on subsequent.
+      // Conditions: min_step > 0 (no cross-attention memory access needed),
+      // no structural changes (cache pad, defrag, fill), not capturing attention.
+      {
+        const bool can_graph = !no_cuda_graph && device == Device::CUDA
+            && min_step > 0 && !_capture_attention && !graph_structural_change;
+
+        if (can_graph && cuda_graph.is_valid()) {
+          cuda_graph.replay(cuda::get_cuda_stream());
+        } else if (can_graph) {
+          cuda_graph.capture(cuda::get_cuda_stream(), [&] {
+            _decoder(step_offsets_device, full_sample_from_device, batch_state,
+                     &logits, nullptr);
+          });
+          cuda_graph.replay(cuda::get_cuda_stream());
+        } else {
+          cuda_graph.invalidate();
+          _decoder(step_offsets_device, full_sample_from_device, batch_state, &logits,
+                   _capture_attention ? &step_attention : nullptr);
+        }
+        // NOTE: graph_structural_change is reset after Graph 2 (beam search)
+        // so that a structural change invalidates both graphs on the same step.
+      }
+#else
+      _decoder(step_offsets_device, full_sample_from_device, batch_state, &logits,
                _capture_attention ? &step_attention : nullptr);
+#endif
+
       auto t4 = Clock::now();
       t_decoder += elapsed_ms(t3, t4);
-
-      // Note: without sync, t_decoder captures launch time, not GPU time.
-      // For production this is fine; add synchronize_stream(device) here for profiling.
 
       // Remove temporary state entries after the decode step.
       batch_state.erase("cache_write_positions");
       batch_state.erase("step_offsets_cpu");
+      batch_state.erase("min_step");
       batch_state.erase("no_self_attn_mask");
 
       // Accumulate cross-attention weights per step using pre-allocated buffer.
@@ -1200,6 +1282,7 @@ namespace ctranslate2 {
       // GPU pipeline Phase B: sync previous D2H and do CPU bookkeeping BEFORE
       // logits processing, so that slot.beam_tokens is up-to-date for the
       // Whisper timestamp/suppression logic.
+      auto t5a = Clock::now();
 #ifdef CT2_WITH_CUDA
       if (use_gpu_beam_pipeline && pending_beam_sync) {
           cudaEventSynchronize(d2h_event);
@@ -1349,6 +1432,9 @@ namespace ctranslate2 {
       }
 #endif
 
+      auto t5b = Clock::now();
+      t_phase_b += elapsed_ms(t5a, t5b);
+
       // Apply logits processors.
       DisableTokens disable_tokens(logits);
       for (const auto& proc : _logits_processors)
@@ -1356,7 +1442,7 @@ namespace ctranslate2 {
       disable_tokens.apply();
 
       auto t6 = Clock::now();
-      t_logits_proc += elapsed_ms(t5, t6);
+      t_logits_proc += elapsed_ms(t5b, t6);
 
       // --- Greedy path (beam_size == 1) ---
 
@@ -1415,14 +1501,15 @@ namespace ctranslate2 {
         ops::LogSoftMax()(logits);
 
         // 2. Add cumulative beam scores on GPU.
+        // Total_batch sized: inactive slots get 0.0f scores (logits are garbage anyway).
         {
-          StorageView active_beam_scores({active_batch}, 0.0f);
+          StorageView full_beam_scores({total_batch}, 0.0f);
           for (size_t s = 0; s < active_count; ++s) {
             for (dim_t b = 0; b < _beam_size; ++b)
-              active_beam_scores.at<float>(
+              full_beam_scores.at<float>(
                 static_cast<dim_t>(s) * _beam_size + b) = slots[s].beam_scores[b];
           }
-          StorageView beam_scores_device(active_beam_scores);
+          StorageView beam_scores_device(full_beam_scores);
           if (device != Device::CPU) {
             if (beam_scores_device.dtype() != logits.dtype())
               beam_scores_device = beam_scores_device.to(logits.dtype());
@@ -1437,7 +1524,10 @@ namespace ctranslate2 {
 
         const dim_t vocab_size = logits.dim(-1);
 
-        logits.reshape({static_cast<dim_t>(active_count),
+        // Reshape [total_batch, vocab] → [max_slots, beam_size * vocab].
+        // Inactive slots produce garbage TopK results but are never read
+        // (selection only iterates active_slot_indices).
+        logits.reshape({static_cast<dim_t>(_max_slots),
                         _beam_size * vocab_size});
 
         const dim_t num_candidates = 2 * _beam_size;
@@ -1612,8 +1702,7 @@ namespace ctranslate2 {
 
         }
 
-        if (active_count < _max_slots)
-          resize_batch_state(batch_state, static_cast<dim_t>(_max_slots));
+        // Step 2: no resize needed — batch_state is always total_batch sized.
 
         bool is_identity = true;
         for (dim_t i = 0; i < total_batch && is_identity; ++i)
@@ -1667,50 +1756,152 @@ namespace ctranslate2 {
         // slot.beam_tokens is up-to-date for the Whisper logits processor.
 
         // Phase C: LogSoftMax → AddDepthBroadcast → TopK → beam_select → Gather → D2H.
+        // Graph 2 captures the GPU-only portion (LogSoftMax through D2D copies).
+        // Gather loop and D2H copies remain outside the graph.
 
-        // 1. In-place LogSoftMax.
+        const dim_t vocab_size = logits.dim(-1);
+        const dim_t num_candidates = 2 * _beam_size;
+        const cudaStream_t stream = cuda::get_cuda_stream();
+
+        // Batch state references (stable pointers, safe for graph capture).
+        auto& bs_gather = batch_state["_bs_gather_indices"];
+        auto& bs_next_tokens = batch_state["_bs_next_tokens"];
+        auto& bs_scores_out = batch_state["_bs_beam_scores"];
+        auto& bs_finished_in = batch_state["_bs_beam_finished"];
+        auto& bs_finished_out = batch_state["_bs_beam_finished"];  // in-place update
+        auto& bs_slot_finished = batch_state["memory_bs_slot_finished"];
+        auto& bs_num_finished_in = batch_state["memory_bs_num_finished"];
+        auto& bs_num_finished_out = batch_state["memory_bs_num_finished"];
+        auto& bs_eos_beam_ids = batch_state["_bs_eos_beam_ids"];
+        auto& bs_eos_scores = batch_state["_bs_eos_scores"];
+        auto& bs_num_eos = batch_state["memory_bs_num_eos"];
+        auto& bs_needs_gather = batch_state["memory_bs_needs_gather"];
+        auto& bs_steps = batch_state["memory_bs_steps"];
+        auto& bs_prompt_lengths = batch_state["memory_bs_prompt_lengths"];
+        auto& bs_end_ids = end_ids_device;
+        StorageView& full_gather = full_gather_persistent;
+        auto& bs_sample = batch_state["_bs_sample_from"];
+
+        // 1. In-place LogSoftMax on [total_batch, vocab_size] shape (must be before reshape).
         ops::LogSoftMax()(logits);
 
-        // 2. Add cumulative beam scores from GPU-resident buffer.
-        //    Convert beam_scores (float32, tiny: active_batch elements) to logits dtype
-        //    to avoid converting the full logits tensor (active_batch × vocab_size).
+        // 2. Add cumulative beam scores.
+        //    Convert beam_scores (float32) → logits dtype into persistent buffer,
+        //    then add_depth_broadcast in-place on logits.
         {
-          auto& bs_scores = batch_state["_bs_beam_scores"];
-          StorageView beam_scores_cast(bs_scores);
-          if (beam_scores_cast.dtype() != logits.dtype())
-            beam_scores_cast = beam_scores_cast.to(logits.dtype());
-          DEVICE_AND_TYPE_DISPATCH(logits.device(), logits.dtype(),
-            primitives<D>::add_depth_broadcast(beam_scores_cast.data<T>(),
-                                               logits.data<T>(),
-                                               active_batch,
-                                               logits.size()));
+          if (dtype != DataType::FLOAT32) {
+            DEVICE_AND_FLOAT_DISPATCH("beam_scores_convert", device, dtype,
+              primitives<D>::convert(bs_scores_out.data<float>(),
+                                     beam_scores_cast_persistent.data<T>(),
+                                     total_batch));
+            DEVICE_AND_FLOAT_DISPATCH("add_depth_broadcast", device, dtype,
+              primitives<D>::add_depth_broadcast(
+                  beam_scores_cast_persistent.data<T>(),
+                  logits.data<T>(),
+                  total_batch,
+                  logits.size()));
+          } else {
+            DEVICE_AND_FLOAT_DISPATCH("add_depth_broadcast", device, dtype,
+              primitives<D>::add_depth_broadcast(
+                  bs_scores_out.data<T>(),
+                  logits.data<T>(),
+                  total_batch,
+                  logits.size()));
+          }
         }
 
-        // 3. Reshape [active_batch, vocab] → [active_count, beam_size * vocab].
-        const dim_t vocab_size = logits.dim(-1);
-
-        logits.reshape({static_cast<dim_t>(active_count),
+        // 3. Reshape [total_batch, vocab] → [max_slots, beam_size * vocab] for TopK.
+        logits.reshape({static_cast<dim_t>(_max_slots),
                         _beam_size * vocab_size});
 
-        // 4. GPU TopK: [active_count, 2*beam_size] into pre-allocated buffers.
-        const dim_t num_candidates = 2 * _beam_size;
-        // Ensure pre-allocated scores buffer matches logits dtype.
-        if (gpu_topk_scores.dtype() != logits.dtype())
-          gpu_topk_scores = StorageView(logits.dtype(), logits.device());
-        const ops::TopK topk_op(num_candidates);
-        topk_op(logits, gpu_topk_scores, gpu_topk_ids);
+        const bool can_beam_graph = !no_cuda_graph && device == Device::CUDA
+            && min_step > 0 && !_capture_attention && !graph_structural_change
+            && use_gpu_beam_pipeline;
 
-        // Convert topk_scores to float32 for beam_select kernel (tiny tensor).
-        StorageView topk_scores_f32 = (gpu_topk_scores.dtype() != DataType::FLOAT32)
-            ? gpu_topk_scores.to_float32()
-            : gpu_topk_scores;
-        auto& topk_scores_step = topk_scores_f32;
-        auto& topk_ids = gpu_topk_ids;
+        // Lambda capturing the GPU-only Phase C body (TopK onward).
+        // All operations use stable pre-allocated buffers and max_slots/total_batch
+        // sizing so that pointer addresses and grid dimensions remain constant.
+        auto beam_body = [&] {
+          // 4. TopK into pre-allocated buffers (max_slots sized → no resize).
+          const ops::TopK topk_op(num_candidates);
+          topk_op(logits, gpu_topk_scores, gpu_topk_ids);
 
-        // Debug: dump TopK results and EOS positions for first slot.
-        if (debug_defrag && active_count > 0) {
-          StorageView ids_cpu = topk_ids.to(Device::CPU);
-          StorageView scores_cpu = topk_scores_step.to(Device::CPU);
+          // 5. Convert topk_scores → float32 into persistent buffer for beam_select.
+          if (dtype != DataType::FLOAT32) {
+            DEVICE_AND_FLOAT_DISPATCH("topk_scores_convert", device, dtype,
+              primitives<D>::convert(gpu_topk_scores.data<T>(),
+                                     topk_scores_f32_persistent.data<float>(),
+                                     gpu_topk_scores.size()));
+          } else {
+            // float32 → just copy (topk_scores_f32_persistent aliases are separate).
+            cudaMemcpyAsync(topk_scores_f32_persistent.data<float>(),
+                            gpu_topk_scores.data<float>(),
+                            gpu_topk_scores.size() * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+          }
+
+          // 6. GPU beam selection — uses max_slots blocks (inactive slots produce
+          //    safe garbage thanks to beam_id clamp in the kernel).
+          cuda::beam_select_async(
+              gpu_topk_ids.data<int32_t>(),
+              topk_scores_f32_persistent.data<float>(),
+              bs_scores_out.data<float>(),
+              bs_finished_in.data<int32_t>(),
+              bs_num_finished_in.data<int32_t>(),
+              bs_steps.data<int32_t>(),
+              bs_prompt_lengths.data<int32_t>(),
+              bs_end_ids.data<int32_t>(),
+              bs_gather.data<int32_t>(),
+              bs_next_tokens.data<int32_t>(),
+              bs_scores_out.data<float>(),
+              bs_finished_out.data<int32_t>(),
+              bs_slot_finished.data<int32_t>(),
+              bs_num_finished_out.data<int32_t>(),
+              bs_eos_beam_ids.data<int32_t>(),
+              bs_eos_scores.data<float>(),
+              bs_num_eos.data<int32_t>(),
+              bs_needs_gather.data<int32_t>(),
+              static_cast<int32_t>(_max_slots),  // max_slots, not active_count
+              static_cast<int32_t>(_beam_size),
+              static_cast<int32_t>(num_candidates),
+              static_cast<int32_t>(vocab_size),
+              static_cast<int32_t>(_max_length),
+              static_cast<int32_t>(_max_candidates),
+              _length_penalty,
+              static_cast<int32_t>(_end_ids.size()),
+              stream);
+
+          // 7. Build full gather indices: identity for all total_batch rows,
+          //    then overwrite with beam_select output (total_batch sized D2D).
+          cuda::fill_identity_async(full_gather.data<int32_t>(),
+                                    static_cast<int32_t>(total_batch), stream);
+          cudaMemcpyAsync(full_gather.data<int32_t>(),
+                          bs_gather.data<int32_t>(),
+                          total_batch * sizeof(int32_t),
+                          cudaMemcpyDeviceToDevice, stream);
+
+          // 8. Copy next_tokens → sample_from on GPU (total_batch sized D2D).
+          cudaMemcpyAsync(bs_sample.data<int32_t>(),
+                          bs_next_tokens.data<int32_t>(),
+                          total_batch * sizeof(int32_t),
+                          cudaMemcpyDeviceToDevice, stream);
+        };
+
+        // Graph 2: capture/replay the beam body.
+        if (can_beam_graph && cuda_graph_beam.is_valid()) {
+          cuda_graph_beam.replay(stream);
+        } else if (can_beam_graph) {
+          cuda_graph_beam.capture(stream, beam_body);
+          cuda_graph_beam.replay(stream);
+        } else {
+          cuda_graph_beam.invalidate();
+          beam_body();
+        }
+
+        // Debug: dump TopK results (D2H — must be outside graph).
+        if (debug_defrag && !cuda::g_cuda_graph_capturing && active_count > 0) {
+          StorageView ids_cpu = gpu_topk_ids.to(Device::CPU);
+          StorageView scores_cpu = topk_scores_f32_persistent.to(Device::CPU);
           fprintf(stderr, "[GPU_TOPK] slot0 top3: ");
           for (dim_t k = 0; k < 3 && k < num_candidates; ++k) {
             int32_t flat = ids_cpu.at<int32_t>({0, k});
@@ -1727,93 +1918,18 @@ namespace ctranslate2 {
           fprintf(stderr, "\n");
         }
 
-        // 5. GPU beam selection kernel — produces gather_indices, next_tokens,
-        //    beam_scores, beam_finished, slot_finished, EOS info on GPU.
-        auto& bs_gather = batch_state["_bs_gather_indices"];
-        auto& bs_next_tokens = batch_state["_bs_next_tokens"];
-        auto& bs_scores_out = batch_state["_bs_beam_scores"];
-        auto& bs_finished_in = batch_state["_bs_beam_finished"];
-        auto& bs_finished_out = batch_state["_bs_beam_finished"];  // in-place update
-        auto& bs_slot_finished = batch_state["memory_bs_slot_finished"];
-        auto& bs_num_finished_in = batch_state["memory_bs_num_finished"];
-        auto& bs_num_finished_out = batch_state["memory_bs_num_finished"];
-        auto& bs_eos_beam_ids = batch_state["_bs_eos_beam_ids"];
-        auto& bs_eos_scores = batch_state["_bs_eos_scores"];
-        auto& bs_num_eos = batch_state["memory_bs_num_eos"];
-        auto& bs_needs_gather = batch_state["memory_bs_needs_gather"];
-        auto& bs_steps = batch_state["memory_bs_steps"];
-        auto& bs_prompt_lengths = batch_state["memory_bs_prompt_lengths"];
-        auto& bs_end_ids = end_ids_device;
+        // --- OUTSIDE graph: Gather loop, D2H copies, event record ---
 
-        // beam_select writes beam_scores output to a separate location if needed,
-        // but for in-place we need a temporary for the input scores.
-        // The kernel reads beam_scores_in and writes beam_scores_out.
-        // Since we want in-place, we need to copy scores to a temp first.
-        // Actually, the kernel reads from topk_scores (not beam_scores_in directly
-        // for output scores) — beam_scores_in is only used for... checking.
-        // Looking at the kernel: beam_scores_in is not actually read in the current
-        // implementation. The kernel writes topk score to beam_scores_out.
-        // So we can safely use the same buffer for in and out.
-
-        cuda::beam_select_async(
-            topk_ids.data<int32_t>(),
-            topk_scores_step.data<float>(),
-            bs_scores_out.data<float>(),       // beam_scores_in (read for reference)
-            bs_finished_in.data<int32_t>(),     // beam_finished_in
-            bs_num_finished_in.data<int32_t>(), // num_finished_in
-            bs_steps.data<int32_t>(),
-            bs_prompt_lengths.data<int32_t>(),
-            bs_end_ids.data<int32_t>(),
-            bs_gather.data<int32_t>(),          // output: gather_indices
-            bs_next_tokens.data<int32_t>(),     // output: next_tokens
-            bs_scores_out.data<float>(),        // output: beam_scores
-            bs_finished_out.data<int32_t>(),    // output: beam_finished
-            bs_slot_finished.data<int32_t>(),   // output: slot_finished
-            bs_num_finished_out.data<int32_t>(),// output: num_finished
-            bs_eos_beam_ids.data<int32_t>(),    // output: eos_beam_ids
-            bs_eos_scores.data<float>(),        // output: eos_scores
-            bs_num_eos.data<int32_t>(),         // output: num_eos_per_slot
-            bs_needs_gather.data<int32_t>(),    // output: slot_needs_gather
-            static_cast<int32_t>(active_count),
-            static_cast<int32_t>(_beam_size),
-            static_cast<int32_t>(num_candidates),
-            static_cast<int32_t>(vocab_size),
-            static_cast<int32_t>(_max_length),
-            static_cast<int32_t>(_max_candidates),
-            _length_penalty,
-            static_cast<int32_t>(_end_ids.size()));
-
-        {
+        // Error check (must be outside graph — calls cudaGetLastError).
+        if (!cuda::g_cuda_graph_capturing) {
           auto err = cudaGetLastError();
           if (err != cudaSuccess)
-            fprintf(stderr, "[DBG] beam_select_async error: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "[DBG] beam graph error: %s\n", cudaGetErrorString(err));
         }
-        // 6. Resize back to max before Gather.
-        if (active_count < _max_slots)
-          resize_batch_state(batch_state, static_cast<dim_t>(_max_slots));
 
-        // 7. Apply beam reordering using GPU-resident gather_indices.
-        //    Always apply — skipping based on previous step's pattern is unsafe because
-        //    identity gathers one step don't guarantee identity the next step.
+        // Gather loop over batch_state KV caches — can't capture because
+        // in-place Gather does move+allocate+gather (pointer swaps).
         {
-          // Build full gather indices using the pre-allocated persistent buffer.
-          // fill_identity_async fills all rows asynchronously, then we overwrite
-          // the active portion with beam_select output (D2D copy).
-          StorageView& full_gather = full_gather_persistent;
-          cuda::fill_identity_async(full_gather.data<int32_t>(),
-                                    static_cast<int32_t>(total_batch));
-          {
-            auto err = cudaGetLastError();
-            if (err != cudaSuccess)
-              fprintf(stderr, "[DBG] fill_identity error: %s\n", cudaGetErrorString(err));
-          }
-          if (active_batch > 0 && active_batch <= total_batch) {
-            cudaMemcpyAsync(full_gather.data<int32_t>(),
-                            bs_gather.data<int32_t>(),
-                            active_batch * sizeof(int32_t),
-                            cudaMemcpyDeviceToDevice);
-          }
-
           for (auto& [name, value] : batch_state) {
             if (name.find("_retain_memory") != std::string::npos)
               continue;
@@ -1823,7 +1939,6 @@ namespace ctranslate2 {
               continue;
             if (name == "accumulated_attention")
               continue;
-            // Skip our beam state buffers — they're already updated by the kernel.
             if (name.find("_bs_") != std::string::npos)
               continue;
             if (value && value.dim(0) == total_batch)
@@ -1831,16 +1946,7 @@ namespace ctranslate2 {
           }
         }
 
-        // 8. Copy next_tokens → sample_from on GPU (D2D).
-        {
-          auto& bs_sample = batch_state["_bs_sample_from"];
-          cudaMemcpyAsync(bs_sample.data<int32_t>(),
-                          bs_next_tokens.data<int32_t>(),
-                          active_batch * sizeof(int32_t),
-                          cudaMemcpyDeviceToDevice);
-        }
-
-        // 9. Async D2H to pinned staging buffers.
+        // D2H copies — variable sizes using active_count/active_batch.
         cudaMemcpyAsync(staging_next_tokens, bs_next_tokens.data<int32_t>(),
                         active_batch * sizeof(int32_t), cudaMemcpyDeviceToHost);
         cudaMemcpyAsync(staging_gather_indices, bs_gather.data<int32_t>(),
@@ -1877,12 +1983,16 @@ namespace ctranslate2 {
 #endif
       }
 
+#ifdef CT2_WITH_CUDA
+      // Reset structural change flag AFTER both Graph 1 (decoder) and Graph 2 (beam)
+      // have had a chance to invalidate/re-capture on the same step.
+      graph_structural_change = false;
+#endif
+
       auto t7 = Clock::now();
       t_selection += elapsed_ms(t6, t7);
 
-      // --- Resize back (greedy path — beam path already resized above) ---
-      if (_beam_size == 1 && active_count < _max_slots)
-        resize_batch_state(batch_state, static_cast<dim_t>(_max_slots));
+      // Step 2: no resize needed — batch_state is always total_batch sized.
 
       auto t8 = Clock::now();
       t_resize_up += elapsed_ms(t7, t8);
@@ -1907,7 +2017,22 @@ namespace ctranslate2 {
           pending_beam_active_count = w;
         }
 #endif
+        // Compact CPU shadow to match defragment_slots compaction.
+        {
+          size_t w = 0;
+          for (size_t r = 0; r < _max_slots; ++r) {
+            if (slots[r].active) {
+              if (w != r)
+                slot_cache_lengths[w] = slot_cache_lengths[r];
+              ++w;
+            }
+          }
+        }
         active_count = defragment_slots(slots, batch_state);
+#ifdef CT2_WITH_CUDA
+        // Defrag moved cache data → GPU addresses in scatter kernels are stale.
+        graph_structural_change = true;
+#endif
       }
 
       auto t9 = Clock::now();
@@ -1916,13 +2041,66 @@ namespace ctranslate2 {
       if (active_count == 0)
         break;
 
-      // --- Fill new slots at the end of the compacted region ---
+      // --- Step 3: Deferred slot fill ---
+      // Always defrag immediately (above) but defer fill to every K steps.
+      // K=1 when queue has pending requests (fill every step for throughput).
+      // K=2-4 when queue is empty (no new work to schedule, save overhead).
       size_t prev_active = active_count;
-      for (size_t s = active_count; s < _max_slots; ++s) {
-        if (!fill_slot(s, request_queue, queue_provider, slots, batch_state))
-          break;
-        slots[s].attention_step_offset = attention_time;
-        ++active_count;
+      {
+        steps_since_fill++;
+        const bool has_empty_slots = (active_count < _max_slots);
+        // Check if queue likely has pending requests without consuming them.
+        // request_queue is the local queue; queue_provider being non-null means
+        // external queue exists (but we can't peek it). Use fill_interval=1
+        // when queue_provider exists and we haven't recently failed to fill.
+        const bool may_have_pending = !request_queue.empty()
+            || (queue_provider && fill_interval <= 1);
+        const bool should_fill =
+            (steps_since_fill >= fill_interval)
+            || (may_have_pending && has_empty_slots);
+
+        if (should_fill && has_empty_slots) {
+          const size_t before_fill = active_count;
+          for (size_t s = active_count; s < _max_slots; ++s) {
+            if (!fill_slot(s, request_queue, queue_provider, slots, batch_state))
+              break;
+            slots[s].attention_step_offset = attention_time;
+            slot_cache_lengths[s] = slots[s].prompt_length;
+            ++active_count;
+          }
+          steps_since_fill = 0;
+          // Adaptive interval: stay aggressive when we filled slots, slow down when empty.
+          if (active_count > before_fill) {
+            fill_interval = 1;  // Got work, stay aggressive.
+#ifdef CT2_WITH_CUDA
+            // New slot at step 0 → cross-attention code path differs → invalidate.
+            graph_structural_change = true;
+#endif
+          } else {
+            // fill_slot returned false (queue empty). Ramp up interval.
+            fill_interval = std::min(fill_interval + 1, size_t(4));
+          }
+        }
+      }
+
+      // Reset cache_lengths for inactive rows to 1 (safe value for no-resize mode).
+      // After defrag + fill, rows [active_count..max_slots) are inactive.
+      if (active_count < _max_slots) {
+        auto& cl = batch_state["cache_lengths"];
+        const dim_t inactive_start = static_cast<dim_t>(active_count) * _beam_size;
+        const dim_t inactive_count = total_batch - inactive_start;
+#ifdef CT2_WITH_CUDA
+        if (cl && cl.device() == Device::CUDA && inactive_count > 0)
+          cuda::fill_int32_gpu(cl.data<int32_t>() + inactive_start, 1, inactive_count);
+        else
+#endif
+        if (cl) {
+          for (dim_t i = inactive_start; i < total_batch; ++i)
+            cl.at<int32_t>(i) = 1;
+        }
+        // Also reset CPU shadow for inactive slots.
+        for (size_t s = active_count; s < _max_slots; ++s)
+          slot_cache_lengths[s] = 1;
       }
 
       auto t10 = Clock::now();
@@ -2055,19 +2233,25 @@ namespace ctranslate2 {
       }
 #endif
 
-      // Update cache_lengths for active slots (always on CPU).
-      auto& cache_lengths = batch_state["cache_lengths"];
-      if (cache_lengths) {
-        for (size_t s = 0; s < _max_slots; ++s) {
-          if (slots[s].active) {
-            // For GPU pipeline: use speculative step (step + 1 for continuing slots).
-            const int32_t cl = use_gpu_beam_pipeline && s < prev_active
-              ? static_cast<int32_t>(slots[s].step + 1)
-              : static_cast<int32_t>(slots[s].step);
-            for (dim_t b = 0; b < _beam_size; ++b)
-              cache_lengths.at<int32_t>(static_cast<dim_t>(s) * _beam_size + b) = cl;
-          }
+      // Update cache_lengths: GPU increment for continuing slots, CPU shadow update.
+      // Continuing slots at positions 0..prev_active-1 need +1 (both for greedy
+      // where slot.step was already incremented, and GPU pipeline where we speculate).
+      // Newly filled slots at prev_active..active_count-1 were set by fill_slot.
+      {
+        auto& cache_lengths = batch_state["cache_lengths"];
+        const dim_t incr_count = static_cast<dim_t>(prev_active) * _beam_size;
+#ifdef CT2_WITH_CUDA
+        if (cache_lengths && cache_lengths.device() == Device::CUDA && incr_count > 0)
+          cuda::increment_cache_lengths_gpu(cache_lengths.data<int32_t>(), incr_count);
+        else
+#endif
+        if (cache_lengths) {
+          for (dim_t i = 0; i < incr_count; ++i)
+            cache_lengths.at<int32_t>(i) += 1;
         }
+        // Update CPU shadow.
+        for (size_t s = 0; s < prev_active; ++s)
+          slot_cache_lengths[s]++;
       }
 
       auto t11 = Clock::now();
@@ -2182,11 +2366,11 @@ namespace ctranslate2 {
       fprintf(stderr,
         "[DECODE PROFILE] steps=%zu  total=%.1fms  per_step=%.2fms  GPU%%=%.1f%%\n"
         "  slot_mgmt=%.1f  cache_pad=%.1f  step_setup=%.1f  DECODER=%.1f\n"
-        "  attn_accum=%.1f  logits=%.1f  selection=%.1f  resize_up=%.1f\n"
+        "  attn_accum=%.1f  phase_b=%.1f  logits_proc=%.1f  selection=%.1f  resize_up=%.1f\n"
         "  defrag=%.1f  fill=%.1f  rebuild=%.1f\n",
         step_count, total_ms, per_step, gpu_pct,
         t_slot_mgmt, t_cache_pad, t_step_setup, t_decoder,
-        t_attn_accum, t_logits_proc, t_selection, t_resize_up,
+        t_attn_accum, t_phase_b, t_logits_proc, t_selection, t_resize_up,
         t_defrag, t_fill, t_rebuild);
     }
 

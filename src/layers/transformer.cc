@@ -8,6 +8,8 @@
 
 #ifdef CT2_WITH_CUDA
 #include "cuda/utils.h"
+#include "cuda/cb_ops.h"
+#include "cuda/cuda_graph.h"
 #endif
 
 namespace ctranslate2 {
@@ -999,6 +1001,22 @@ namespace ctranslate2 {
 #endif
     }
 
+    void TransformerDecoder::ensure_cb_buffers(dim_t total_batch,
+                                               DataType dtype,
+                                               Device device) {
+      if (_cb_buffers.allocated_batch == total_batch
+          && _cb_buffers.buf[0].device() == device
+          && _cb_buffers.buf[0].dtype() == dtype)
+        return;
+
+      const dim_t d_model = _embeddings.output_size();
+      _cb_buffers.buf[0] = StorageView({total_batch, dim_t(1), d_model}, dtype, device);
+      _cb_buffers.buf[1] = StorageView({total_batch, dim_t(1), d_model}, dtype, device);
+      _cb_buffers.attn_lengths = StorageView({total_batch}, DataType::INT32, device);
+      _cb_buffers.position_bias = StorageView(dtype, device);
+      _cb_buffers.allocated_batch = total_batch;
+    }
+
     void TransformerDecoder::decode(const StorageView& ids,
                                     const StorageView* lengths,
                                     const StorageView& step_offsets,
@@ -1021,7 +1039,7 @@ namespace ctranslate2 {
 
 #ifdef CT2_WITH_CUDA
       auto dp_sync_now = [&]() -> std::chrono::steady_clock::time_point {
-        if (dp_enabled && device == Device::CUDA)
+        if (dp_enabled && device == Device::CUDA && !cuda::g_cuda_graph_capturing)
           synchronize_stream(device);
         return std::chrono::steady_clock::now();
       };
@@ -1033,65 +1051,98 @@ namespace ctranslate2 {
       auto dp_t0 = dp_t_total_start;
 #endif
 
-      // Read offsets on CPU for control flow decisions.
-      // Check batch_state for pre-computed CPU copy to avoid GPU→CPU sync.
+      // Read min_step from pre-computed scalar in batch_state (set by CB engine),
+      // or fall back to computing from offsets on CPU.
       StorageView offsets_cpu(DataType::INT32);
-      const auto step_offsets_cpu_it = state.find("step_offsets_cpu");
-      if (step_offsets_cpu_it != state.end())
-        offsets_cpu.shallow_copy(step_offsets_cpu_it->second);
-      else if (step_offsets.device() != Device::CPU)
-        offsets_cpu.copy_from(step_offsets.to(Device::CPU));
-      else
-        offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
-
-      const dim_t batch_size_raw = offsets_cpu.size();
-      dim_t min_step = offsets_cpu.at<int32_t>(0);
-      for (dim_t i = 1; i < batch_size_raw; ++i)
-        min_step = std::min(min_step, dim_t(offsets_cpu.at<int32_t>(i)));
+      dim_t min_step = 0;
+      {
+        const auto min_step_it = state.find("min_step");
+        if (min_step_it != state.end() && min_step_it->second) {
+          min_step = min_step_it->second.at<int32_t>(0);
+        } else {
+          // Fallback: read offsets on CPU.
+          const auto step_offsets_cpu_it = state.find("step_offsets_cpu");
+          if (step_offsets_cpu_it != state.end())
+            offsets_cpu.shallow_copy(step_offsets_cpu_it->second);
+          else if (step_offsets.device() != Device::CPU)
+            offsets_cpu.copy_from(step_offsets.to(Device::CPU));
+          else
+            offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
+          const dim_t batch_size_raw = offsets_cpu.size();
+          min_step = offsets_cpu.at<int32_t>(0);
+          for (dim_t i = 1; i < batch_size_raw; ++i)
+            min_step = std::min(min_step, dim_t(offsets_cpu.at<int32_t>(i)));
+        }
+      }
+      // Ensure offsets_cpu is available for position encoder (if not already set).
+      if (!offsets_cpu) {
+        const auto step_offsets_cpu_it = state.find("step_offsets_cpu");
+        if (step_offsets_cpu_it != state.end())
+          offsets_cpu.shallow_copy(step_offsets_cpu_it->second);
+        else if (step_offsets.device() != Device::CPU)
+          offsets_cpu.copy_from(step_offsets.to(Device::CPU));
+        else
+          offsets_cpu.shallow_copy(const_cast<StorageView&>(step_offsets));
+      }
 
 #ifdef CT2_WITH_CUDA
       auto dp_t1 = dp_sync_now();  // End Phase A
 #endif
 
-      StorageView layer_in(dtype, device);
-      StorageView layer_out(dtype, device);
+      // Pre-allocate ping-pong buffers for stable GPU addresses (CUDA graph support).
+      const dim_t total_batch = ids.dim(0);
+      ensure_cb_buffers(total_batch, dtype, device);
 
-      _embeddings(ids, layer_in);
+      // cur tracks which ping-pong buffer holds the current data.
+      int cur = 0;
+      StorageView (&buf)[2] = _cb_buffers.buf;
+
+      _embeddings(ids, buf[cur]);
       // _start_from_zero_embedding and _embeddings_scale are not used by Whisper.
       // For generality, apply them based on min_step.
       if (_start_from_zero_embedding)
-        zero_first_timestep(layer_in, min_step);
+        zero_first_timestep(buf[cur], min_step);
       if (_embeddings_scale && (!_start_from_zero_embedding || min_step != 0))
-        ops::Mul()(layer_in, *_embeddings_scale, layer_in);
+        ops::Mul()(buf[cur], *_embeddings_scale, buf[cur]);
       if (_project_in) {
-        (*_project_in)(layer_in, layer_out);
-        layer_in = std::move(layer_out);
+        (*_project_in)(buf[cur], buf[1 - cur]);
+        cur = 1 - cur;
       }
-      if (layer_in.rank() == 2)
-        layer_in.expand_dims(1);
+      if (buf[cur].rank() == 2)
+        buf[cur].expand_dims(1);
 
 #ifdef CT2_WITH_CUDA
       auto dp_t2 = dp_sync_now();  // End Phase B (embedding + scale + project_in)
 #endif
 
       // Per-element position encoding.
-      // Pass CPU offsets to avoid GPU→CPU sync inside the position encoder.
-      if (_position_encoder)
-        (*_position_encoder)(layer_in, static_cast<const StorageView&>(offsets_cpu));
+      if (_position_encoder) {
+#ifdef CT2_WITH_CUDA
+        if (cuda::g_cuda_graph_capturing) {
+          // During graph capture: pass GPU offsets so the captured kernel reads from
+          // the GPU buffer (updated each step) instead of a baked CPU pointer offset.
+          (*_position_encoder)(buf[cur], step_offsets);
+        } else
+#endif
+        {
+          // Normal path: pass CPU offsets to avoid GPU→CPU sync inside position encoder.
+          (*_position_encoder)(buf[cur], static_cast<const StorageView&>(offsets_cpu));
+        }
+      }
 
 #ifdef CT2_WITH_CUDA
       auto dp_t3 = dp_sync_now();  // End Phase C (position encoding)
 #endif
 
       if (_layernorm_embedding)
-        (*_layernorm_embedding)(layer_in, layer_in);
+        (*_layernorm_embedding)(buf[cur], buf[cur]);
 
 #ifdef CT2_WITH_CUDA
       auto dp_t4 = dp_sync_now();  // End Phase D (layernorm_embedding)
 #endif
 
-      const dim_t batch_size = layer_in.dim(0);
-      const dim_t max_time = layer_in.dim(1);
+      const dim_t batch_size = buf[cur].dim(0);
+      const dim_t max_time = buf[cur].dim(1);
 
       const bool allow_padding_removal = Padder::allow_padding_removal(_device, _compute_type);
 
@@ -1109,14 +1160,23 @@ namespace ctranslate2 {
         if (_tensor_parallel)
           num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
 
-        StorageView attn_lengths({batch_size}, DataType::INT32);
         const StorageView& cl = cache_lengths_it->second;
+        // Use pre-allocated attn_lengths buffer (stable address for CUDA graph).
+        StorageView& attn_lengths = _cb_buffers.attn_lengths;
 
-        for (dim_t b = 0; b < batch_size; ++b)
-          attn_lengths.at<int32_t>(b) = cl.at<int32_t>(b) + max_time;
-
-        if (device != Device::CPU)
-          attn_lengths = attn_lengths.to(device);
+#ifdef CT2_WITH_CUDA
+        if (cl.device() == Device::CUDA) {
+          // GPU kernel: attn_lengths[i] = cl[i] + max_time.
+          cuda::add_scalar_int32_gpu(attn_lengths.data<int32_t>(),
+                                     cl.data<int32_t>(),
+                                     static_cast<int32_t>(max_time),
+                                     static_cast<int>(batch_size));
+        } else
+#endif
+        {
+          for (dim_t b = 0; b < batch_size; ++b)
+            attn_lengths.at<int32_t>(b) = cl.at<int32_t>(b) + max_time;
+        }
 
         StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
           attn_lengths,
@@ -1170,7 +1230,8 @@ namespace ctranslate2 {
       if (attention)
         alignment_heads.reserve(_layers.size());
 
-      StorageView position_bias(dtype, device);
+      // Reuse pre-allocated position_bias (empty for Whisper, stable address).
+      StorageView& position_bias = _cb_buffers.position_bias;
 
       // Read cache_write_positions for scatter-based cache updates (mid-decode slot insertion).
       const auto wp_it = state.find("cache_write_positions");
@@ -1186,6 +1247,7 @@ namespace ctranslate2 {
         lp_layer_ms.assign(_layers.size(), 0.0);
 
       // No sliding window chunking — Whisper doesn't use it.
+      // Ping-pong pattern: alternate buf[cur] (input) and buf[1-cur] (output).
       for (size_t l = 0; l < _layers.size(); ++l) {
         StorageView* cached_self_attn_keys = nullptr;
         StorageView* cached_self_attn_values = nullptr;
@@ -1210,13 +1272,13 @@ namespace ctranslate2 {
           layer_attention = std::make_unique<StorageView>(device);
 
 #ifdef CT2_WITH_CUDA
-        if (layer_profile && device == Device::CUDA)
+        if (layer_profile && device == Device::CUDA && !cuda::g_cuda_graph_capturing)
           synchronize_stream(device);
         auto lp_t0 = std::chrono::steady_clock::now();
 #endif
 
         // offset=0 for per-element (position already encoded via per-element offsets).
-        (*_layers[l])(layer_in,
+        (*_layers[l])(buf[cur],
                       input_lengths_mask.get(),
                       memory,
                       memory_lengths_mask.get(),
@@ -1224,7 +1286,7 @@ namespace ctranslate2 {
                       cached_self_attn_values,
                       cached_attn_keys,
                       cached_attn_values,
-                      layer_out,
+                      buf[1 - cur],
                       layer_attention.get(),
                       input_padder.get(),
                       memory_padder.get(),
@@ -1233,7 +1295,7 @@ namespace ctranslate2 {
                       /*offset=*/0);
 
 #ifdef CT2_WITH_CUDA
-        if (layer_profile && device == Device::CUDA) {
+        if (layer_profile && device == Device::CUDA && !cuda::g_cuda_graph_capturing) {
           synchronize_stream(device);
           auto lp_t1 = std::chrono::steady_clock::now();
           double ms = std::chrono::duration<double, std::milli>(lp_t1 - lp_t0).count();
@@ -1242,7 +1304,7 @@ namespace ctranslate2 {
         }
 #endif
 
-        layer_in = std::move(layer_out);
+        cur = 1 - cur;  // Output is now the current buffer.
 
         // Clear scatter positions after each layer call.
         _layers[l]->get_self_attention().set_cache_write_positions(nullptr);
@@ -1302,21 +1364,22 @@ namespace ctranslate2 {
       auto dp_t8 = dp_sync_now();  // End Phase H (attention concat)
 #endif
 
+      // After the layer loop, buf[cur] holds the final layer output.
       if (outputs) {
         if (_output_norm)
-          (*_output_norm)(layer_in, layer_in);
+          (*_output_norm)(buf[cur], buf[cur]);
         if (_project_out) {
-          (*_project_out)(layer_in, layer_out);
-          layer_in = std::move(layer_out);
+          (*_project_out)(buf[cur], buf[1 - cur]);
+          cur = 1 - cur;
         }
 
         if (_outputs_scale)
-          ops::Mul()(layer_in, *_outputs_scale, layer_in);
+          ops::Mul()(buf[cur], *_outputs_scale, buf[cur]);
 
         if (return_logits)
-          _proj(layer_in, *outputs);
+          _proj(buf[cur], *outputs);
         else
-          *outputs = std::move(layer_in);
+          *outputs = std::move(buf[cur]);
 
         if (!is_sequence)
           outputs->squeeze(1);

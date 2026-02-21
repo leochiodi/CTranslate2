@@ -14,6 +14,7 @@
 #ifdef CT2_WITH_CUDA
 #include "cuda/batch_copy.h"
 #include "cuda/cb_ops.h"
+#include "cuda/cuda_graph.h"
 #include "cuda/utils.h"
 #endif
 
@@ -50,6 +51,31 @@ namespace ctranslate2 {
 
 #ifdef CT2_WITH_CUDA
       if (device == Device::CUDA) {
+        // CUDA graph capture: skip CPU uniform check, always use GPU scatter kernel.
+        // The uniform fast-path uses cudaMemcpy2DAsync with a CPU-computed offset that
+        // gets baked into the graph; on replay it would write to the stale position.
+        // The scatter kernel reads positions from a GPU buffer updated each step.
+        if (cuda::g_cuda_graph_capturing) {
+          const int32_t* pos_gpu;
+          StorageView pos_gpu_tmp;
+          if (positions.device() == Device::CUDA) {
+            pos_gpu = positions.data<int32_t>();
+          } else {
+            pos_gpu_tmp = positions.to(Device::CUDA);
+            pos_gpu = pos_gpu_tmp.data<int32_t>();
+          }
+          cuda::scatter_cache_step_gpu(
+              cache.buffer(),
+              step.buffer(),
+              pos_gpu,
+              static_cast<int>(batch),
+              static_cast<int>(heads),
+              static_cast<int>(cache_time),
+              static_cast<int>(d),
+              static_cast<int>(elem_bytes));
+          return;
+        }
+
         if (uniform) {
           // All rows write to the same time position → use cudaMemcpy2DAsync.
           // Source: step[batch*heads, 1, d] contiguous, pitch = d * elem_bytes.
