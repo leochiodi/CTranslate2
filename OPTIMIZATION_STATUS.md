@@ -474,3 +474,172 @@ Total: 106  OK: 106  Failed: 0  Wall: 70.9s
 2. Try higher slot counts (e6_s32, e6_s48) — H100 GPU% was only 69.4% at 20 users, plenty of headroom
 3. Consider reducing beam_size from 5→1 (greedy) to reduce batch rows by 5× — quality tradeoff
 4. Consider asymmetric approach: larger max_slots + more encoder threads to max out H100 utilization
+
+## Fused CUDA Kernels: Per-Step 6x Slower → 2x Faster (2026-02-20)
+
+### How the improvement was measured
+
+After the sub-layer profiling (`CT2_SUBLAYER_PROFILE`) revealed the per-layer breakdown
+(self-attn 7.04ms, cross-attn 7.34ms, FFN 5.58ms), we compared the CB decoder step
+against the standard `generate()` path using identical batch sizes. The CB step was
+**~6x slower** per decode step. After the two fixes below, it became **~2x faster**.
+
+### What was slow: the CB-specific operations inside each layer
+
+The sub-layer profiling pointed to two operations that the CB path does differently
+from the standard `generate()` path, executed **inside every decoder layer, every step**:
+
+1. **KV cache scatter writes** (`scatter_cache_step` in `attention.cc`)
+2. **Per-element position encoding** (`PositionEncoder` with vector offsets in `common.cc`)
+
+These are not the self-attention/cross-attention/FFN compute — they're the CB-specific
+setup that runs before/during each layer's attention computation.
+
+### Fix 1: Fused KV cache scatter — `scatter_cache_step_gpu` (cb_ops.cu)
+
+**Before** (attention.cc, non-uniform positions path):
+```cpp
+// CPU builds batch*heads CopyDescriptor structs, uploads, launches kernel
+std::vector<cuda::CopyDescriptor> copies;
+copies.reserve(batch * heads);
+for (dim_t b = 0; b < batch; ++b) {
+    for (dim_t h = 0; h < heads; ++h) {
+        // compute src_off, dst_off...
+        copies.push_back({src, dst, d * elem_bytes});
+    }
+}
+cuda::batch_copy_async(copies);
+```
+
+With 8 slots × beam 5 × 20 heads = 800 copy descriptors per call, and 32 layers × 2
+(K+V) = 64 calls per step → **51,200 descriptors built on CPU per step**. Each call
+did a CPU loop, staged descriptors to a device buffer, then launched the kernel.
+
+**After** (attention.cc → cb_ops.cu):
+```cpp
+// Upload positions (160 bytes), launch one kernel — GPU reads positions directly
+StorageView pos_gpu_sv(pos_cpu.to(Device::CUDA));
+cuda::scatter_cache_step_gpu(cache, step, pos_gpu_sv.data<int32_t>(),
+    batch, heads, cache_time, d, elem_bytes);
+```
+
+Single kernel launch with `batch*heads` thread blocks. Each block reads its write
+position from GPU memory and copies `d` elements using 4-byte coalesced writes.
+No CPU loop, no descriptor staging, no intermediate buffer.
+
+**Savings**: eliminated 51,200 CPU iterations + 64 descriptor uploads per step.
+
+### Fix 2: Fused position encoding — `add_position_encoding_gpu` (cb_ops.cu)
+
+**Before** (common.cc, vector-offsets path):
+```cpp
+// Step 1: CPU loop builds gather indices [batch_size * time]
+StorageView indices({batch_size * time}, DataType::INT32);
+for (b...) for (t...) indices[b*time+t] = offsets[b] + t;
+
+// Step 2: H2D transfer of indices
+indices = indices.to(input.device());
+
+// Step 3: GPU Gather kernel — allocates intermediate tensor
+ops::Gather(0)(encodings, indices, pos_enc);
+
+// Step 4: GPU Add kernel
+ops::Add()(input, pos_enc, input);
+```
+
+Four steps: CPU index loop → H2D transfer → Gather (+ temp allocation) → Add.
+
+**After** (common.cc → cb_ops.cu):
+```cpp
+// Upload offsets (160 bytes), one fused kernel
+StorageView offsets_gpu(offsets_cpu.to(Device::CUDA));
+cuda::add_position_encoding_gpu(input, encodings, offsets_gpu.data<int32_t>(),
+    batch_size, time, depth, elem_bytes);
+```
+
+Single kernel: each thread block handles one `(batch, time)` row, adds
+`encodings[offsets[b]+t, :]` to `input[b, t, :]` in-place using vectorized
+`__half2` adds for fp16. No intermediate allocation, no Gather, no separate Add.
+
+**Savings**: eliminated CPU index loop + H2D transfer + temporary tensor +
+2 kernel launches → replaced with 1 fused kernel.
+
+### Why the micro improvement didn't show in load tests
+
+The sub-layer profiling had already proved that CB in-layer overhead was < 0.5ms
+total across 32 layers. The fused kernels made each step faster in micro-benchmarks,
+but the **absolute wall-clock savings were small** (< 0.5ms per step).
+
+At 80 decode steps per request, that's ~40ms saved per request — invisible when
+requests take 16 seconds at 80 concurrent users. The end-to-end bottleneck was
+never inside the transformer layers; it's:
+
+1. **Slot queuing** — with beam_size=5, each slot uses 5 batch rows. At MAX_SLOTS=16,
+   only 16 of 80 users can decode concurrently. Requests queue 4-5 deep.
+2. **Out-of-layer overhead** — the ~10ms gap between sublayer compute (20ms) and
+   wall-clock per_step (30ms) is CB machinery, kernel launch scheduling, LM head
+   projection, and state management. This overhead is per-step and was NOT reduced
+   by the fused kernels (they only affect in-layer operations).
+3. **CPU oversubscription** (see below) — audio decoding threads competed for CPU.
+
+### Key lesson
+
+Micro-benchmarking individual operations can show dramatic improvements (6x→2x) that
+don't materialize in production load tests because the optimized component was already
+a small fraction of end-to-end latency. The sub-layer profiling correctly showed the
+in-layer overhead was < 0.5ms, but the fused kernels were still implemented since they
+were the right thing to do architecturally (eliminating CPU loops from the GPU hot path).
+
+## Bug: Missing CPU Thread Limits (2026-02-21)
+
+### Problem
+
+Both `server.py` (CB) and `server_old.py` (baseline) were missing the thread
+initialization that prevents CPU oversubscription:
+
+```python
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+```
+
+This was present in production but got lost when the benchmark servers were written.
+
+### Impact
+
+Without these settings, every call to `decode_audio()` / `decode_resample()` (which
+uses torchaudio `Resample` → PyTorch ATen) spawns `OMP_NUM_THREADS` threads. The
+default is the number of CPU cores (e.g., 64-128 on H100 nodes).
+
+At 80 concurrent users:
+- **server.py**: each request runs `decode_audio()` in asyncio's thread pool.
+  80 concurrent × ~64 OMP threads = **~5,120 CPU threads** competing.
+- **server_old.py**: `ProcessPoolExecutor(max_workers=8)` in the preprocessor.
+  8 subprocesses × ~64 OMP threads = **~512 CPU threads** per preprocessor.
+
+This CPU oversubscription slows down:
+- Audio decoding and resampling (torchaudio)
+- VAD inference (Silero ONNX, CPU)
+- Mel feature extraction (numpy/CPU)
+- CUDA driver CPU-side work (kernel launch, stream management)
+
+### Fix
+
+Added `OMP_NUM_THREADS=1` + `torch.set_num_threads(1)` +
+`torch.set_num_interop_threads(1)` at the top of both server files, before any
+other imports. Commit pending.
+
+### Expected impact
+
+- **Moderate to significant for audio decode latency** — the `decode_audio()` step
+  at 80 users was measured at 0.13s per request, but CPU contention from thousands of
+  OMP threads likely inflated this (and all other CPU operations) under load.
+- **Unclear impact on overall p50** — needs re-benchmarking. The decode wait (GPU)
+  still dominates, but reduced CPU contention means faster preprocessing pipeline,
+  which means requests reach the decoder sooner.
+- **Both servers affected equally** — this is not a CB-specific issue. The old server
+  might also improve, keeping the relative comparison similar.
+- **Most impactful at high concurrency** — at 1-5 users, OMP threads don't contend.
+  At 80 users, the effect compounds.
