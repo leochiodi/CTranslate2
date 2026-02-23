@@ -1014,6 +1014,13 @@ namespace ctranslate2 {
       _cb_buffers.buf[1] = StorageView({total_batch, dim_t(1), d_model}, dtype, device);
       _cb_buffers.attn_lengths = StorageView({total_batch}, DataType::INT32, device);
       _cb_buffers.position_bias = StorageView(dtype, device);
+
+      dim_t num_heads_local = _num_heads;
+      if (_tensor_parallel)
+        num_heads_local = SAFE_DIVIDE(num_heads_local, ScopedMPISetter::getNRanks());
+      _cb_buffers.expanded_self_lengths = StorageView({total_batch * num_heads_local}, DataType::INT32, device);
+      _cb_buffers.expanded_memory_lengths = StorageView({total_batch * num_heads_local}, DataType::INT32, device);
+
       _cb_buffers.allocated_batch = total_batch;
     }
 
@@ -1178,14 +1185,27 @@ namespace ctranslate2 {
             attn_lengths.at<int32_t>(b) = cl.at<int32_t>(b) + max_time;
         }
 
-        StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
-          attn_lengths,
-          num_heads,
-          max_time,
-          /*mask_future=*/false,
-          multi_query);
-
-        input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
+#ifdef CT2_WITH_CUDA
+        if (cl.device() == Device::CUDA) {
+          StorageView& expanded = _cb_buffers.expanded_self_lengths;
+          cuda::expand_lengths_gpu(expanded.data<int32_t>(),
+                                   attn_lengths.data<int32_t>(),
+                                   static_cast<int>(num_heads),
+                                   static_cast<int>(batch_size * num_heads));
+          auto tmp = std::make_unique<StorageView>(DataType::INT32, device);
+          tmp->shallow_copy(expanded);
+          input_lengths_mask = std::move(tmp);
+        } else
+#endif
+        {
+          StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
+            attn_lengths,
+            num_heads,
+            max_time,
+            /*mask_future=*/false,
+            multi_query);
+          input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
+        }
       }
 
 #ifdef CT2_WITH_CUDA
@@ -1215,10 +1235,27 @@ namespace ctranslate2 {
           if (_tensor_parallel)
             num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
           const dim_t beam_size = batch_size / memory_lengths->dim(0);
-          memory_lengths_mask = std::make_unique<StorageView>(
-            layers::MultiHeadAttention::prepare_length_mask(*memory_lengths,
-                                                            num_heads,
-                                                            beam_size > 1 ? beam_size : max_time));
+#ifdef CT2_WITH_CUDA
+          if (memory_lengths->device() == Device::CUDA) {
+            const dim_t num_queries = beam_size > 1 ? beam_size : max_time;
+            const int stride = static_cast<int>(num_heads * num_queries);
+            const int total = static_cast<int>(memory_lengths->dim(0) * stride);
+            StorageView& expanded = _cb_buffers.expanded_memory_lengths;
+            cuda::expand_lengths_gpu(expanded.data<int32_t>(),
+                                     memory_lengths->data<int32_t>(),
+                                     stride,
+                                     total);
+            auto tmp = std::make_unique<StorageView>(DataType::INT32, device);
+            tmp->shallow_copy(expanded);
+            memory_lengths_mask = std::move(tmp);
+          } else
+#endif
+          {
+            memory_lengths_mask = std::make_unique<StorageView>(
+              layers::MultiHeadAttention::prepare_length_mask(*memory_lengths,
+                                                              num_heads,
+                                                              beam_size > 1 ? beam_size : max_time));
+          }
         }
       }
 

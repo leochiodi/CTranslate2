@@ -249,6 +249,8 @@ namespace ctranslate2 {
         StorageView buf[2];        // Ping-pong layer I/O: [total_batch, 1, d_model]
         StorageView attn_lengths;  // [total_batch], INT32
         StorageView position_bias; // Empty (reused across steps)
+        StorageView expanded_self_lengths;    // [total_batch * num_heads_local], INT32
+        StorageView expanded_memory_lengths;  // [total_batch * num_heads_local], INT32
         dim_t allocated_batch = 0;
       };
       CbDecodeBuffers _cb_buffers;

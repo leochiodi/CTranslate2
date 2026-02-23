@@ -246,6 +246,35 @@ namespace ctranslate2 {
 
 
     // =========================================================================
+    // expand_lengths_gpu: out[i] = in[i / stride], for i in [0, total)
+    // =========================================================================
+    //
+    // Expands per-batch lengths into per-head lengths.
+    // E.g. for batch=4, num_heads=8: stride=8, total=32.
+    // Each of the 8 consecutive output slots for a batch element gets the same
+    // length value.  This replaces prepare_length_mask() in the CB decode path.
+
+    __global__ void expand_lengths_kernel(
+        int32_t* __restrict__ out,
+        const int32_t* __restrict__ in,
+        int stride,
+        int total) {
+      const int i = blockIdx.x * blockDim.x + threadIdx.x;
+      if (i < total)
+        out[i] = in[i / stride];
+    }
+
+    void expand_lengths_gpu(int32_t* out, const int32_t* in, int stride, int total) {
+      if (total <= 0)
+        return;
+      const int threads = std::min(256, total);
+      const int blocks = (total + threads - 1) / threads;
+      expand_lengths_kernel<<<blocks, threads, 0, get_cuda_stream()>>>(
+          out, in, stride, total);
+    }
+
+
+    // =========================================================================
     // batch_timestamp_check_gpu: batched timestamp probability check
     // =========================================================================
     //

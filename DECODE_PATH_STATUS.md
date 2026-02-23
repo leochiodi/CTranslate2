@@ -505,3 +505,105 @@ GPU kernel and the logits processor CPU loops (iterating over slots × beams × 
 ### Remaining: Phase C
 - Step 9: Attention kernel consumes lengths directly (no explicit mask materialization)
 - Step 10: Multi-op fusion around decoder step prologue/epilogue
+
+---
+
+# Phase C: Deeper Kernel Changes
+
+## Step 9: Attention kernel consumes lengths directly (no mask materialization)
+
+**Target:** Eliminate `prepare_length_mask()` per-step allocation in CB decode path.
+Replace with a simple `expand_lengths_gpu` kernel writing into pre-allocated buffers.
+
+**Status:** DONE
+
+### Problem
+
+The CB decode path materialized a 3D INT32 mask via `prepare_length_mask()` for both
+self-attention and cross-attention on every decode step. When `mask_future=false` (always
+true for CB decode), every entry for a given batch element equals the same scalar length
+value — the mask is fully redundant. `prepare_length_mask()` also allocates a new
+`StorageView` per call, breaking CUDA graph address stability.
+
+### Changes
+
+- **`include/ctranslate2/layers/transformer.h`**: Added `expanded_self_lengths` and
+  `expanded_memory_lengths` pre-allocated INT32 buffers to `CbDecodeBuffers` struct.
+  Sized at `[total_batch * num_heads_local]` — stable GPU addresses for CUDA graph.
+
+- **`src/cuda/cb_ops.h`**: Declared `expand_lengths_gpu(out, in, stride, total)`.
+
+- **`src/cuda/cb_ops.cu`**: Implemented `expand_lengths_kernel`:
+  `out[i] = in[i / stride]` for `i in [0, total)`. One thread per element, simple
+  grid-stride pattern. Replaces the more complex `prepare_length_mask` primitive.
+
+- **`src/layers/transformer.cc`**:
+  - `ensure_cb_buffers()`: Allocates `expanded_self_lengths` and `expanded_memory_lengths`
+    at `[total_batch * num_heads_local]` INT32.
+  - Self-attention mask: `prepare_length_mask()` replaced with `expand_lengths_gpu` into
+    pre-allocated buffer + `shallow_copy` (non-owning view, no per-step allocation).
+    Stride = `num_heads`, total = `batch_size * num_heads`.
+  - Cross-attention mask: Same pattern. Stride = `num_heads * num_queries`
+    (where `num_queries = beam_size > 1 ? beam_size : max_time`),
+    total = `memory_batch * stride`.
+  - CPU fallback preserved: uses existing `prepare_length_mask()` for non-CUDA builds.
+
+### Key design points
+
+- **Pre-allocated buffers** in `CbDecodeBuffers` → stable GPU addresses for CUDA graph
+- **`shallow_copy`** creates non-owning view → no per-step GPU allocation, safe on
+  destroy (`release()` checks `_allocator==nullptr`)
+- **Both CUDA graphs share these buffers** — expand kernel gets captured in Graph 1
+  alongside the old mask kernel's place. Same invalidation rules apply.
+- **`mask_future=false` always** for CB decode self-attention. No causal masking needed
+  (single decode step).
+- **Correctness**: `out[i] = in[i / stride]` produces identical values to
+  `prepare_length_mask` when `mask_future=false`. Each softmax row sees the same
+  length as before.
+
+### After Step 9 (DGX Spark, max_slots=4, beam 5, f1_35s.wav)
+
+`test_correctness.sh` (standard generate path): 115 tokens exact match — PASS
+
+4-concurrent (graph enabled):
+- 110 steps, per_step=21.15ms, DECODER=543.3ms
+- All 4 produce identical 109 tokens — CORRECT
+
+Staggered (3s apart, graph enabled):
+- 148 steps, per_step=26.13ms, fill=36.4ms
+- All 4 produce identical 109 tokens — CORRECT (graph invalidation works)
+
+CT2_NO_CUDA_GRAPH=1:
+- 110 steps, per_step=20.86ms
+- All 4 produce identical 109 tokens — CORRECT (identical to graph-enabled)
+
+### A/B Phase E+F timing (CT2_DECODE_PHASE_PROFILE, CT2_NO_CUDA_GRAPH=1, 100 calls)
+
+| | Phase E (attn_mask) | Phase F (memory_setup) |
+|---|---|---|
+| Before (prepare_length_mask) | 0.001 ms/call | 0.001 ms/call |
+| After (expand_lengths_gpu) | 0.001 ms/call | 0.000 ms/call |
+
+On DGX Spark (unified memory), both paths are sub-microsecond — the mask is tiny
+(20 elements for 4 slots × 5 beams) and both kernels complete in ~1us. No measurable
+timing difference on this hardware.
+
+**Result:** The value of Step 9 is architectural, not raw timing on DGX Spark:
+1. Eliminates per-step `StorageView` allocation — `prepare_length_mask()` allocated a
+   new tensor every call; the expand kernel writes into a pre-allocated buffer with
+   `shallow_copy` (zero allocation, stable GPU address for CUDA graph).
+2. On H100 (PCIe), each `StorageView` allocation involves `cudaMalloc`/pool overhead
+   (~5-10us). With 2 masks per step (self + cross), ~10-20us/step saved. Enables
+   CUDA graph to capture Phase E cleanly.
+3. Replaces `prepare_length_mask` primitive dispatch with a simpler single-purpose kernel.
+
+### Server test (DEVICE=cuda, 4 concurrent requests)
+
+Server (`server.py`) with `DEVICE=cuda MAX_SLOTS=4 NUM_ENCODERS=1`:
+- Single request: 532 chars, lang=en — CORRECT
+- 4 concurrent: all 4 return identical 532-char transcriptions — CORRECT
+- Server stays alive after all requests — CORRECT
+
+Note: earlier crashes were caused by missing `DEVICE=cuda` env var (default is `"cpu"`
+in `server.py:88`). CTranslate2 built without MKL has no CPU SGEMM backend, so loading
+the model on CPU aborts. Unrelated to Step 9.

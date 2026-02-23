@@ -66,5 +66,9 @@ namespace ctranslate2 {
                                    int32_t* results,
                                    int elem_bytes);
 
+    // Expand per-element lengths into per-head lengths: out[i] = in[i / stride].
+    // total = batch * stride (e.g. batch * num_heads).
+    void expand_lengths_gpu(int32_t* out, const int32_t* in, int stride, int total);
+
   }
 }
