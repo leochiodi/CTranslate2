@@ -38,6 +38,11 @@ namespace ctranslate2 {
     DisableTokens(StorageView& logits,
                   const float disable_value = std::numeric_limits<float>::lowest());
 
+    // Constructor with pre-allocated GPU buffer (avoids per-apply cudaMalloc).
+    DisableTokens(StorageView& logits,
+                  StorageView& gpu_buffer,
+                  const float disable_value = std::numeric_limits<float>::lowest());
+
     void add(dim_t batch_id, dim_t token_id) {
       const auto flat_index = batch_id * _vocabulary_size + token_id;
 
@@ -59,6 +64,9 @@ namespace ctranslate2 {
 
     void apply();
 
+    // Apply pre-computed GPU indices directly (no CPU→GPU transfer).
+    void apply_precomputed(const StorageView& gpu_flat_indices);
+
   private:
     StorageView& _logits;
     float* _logits_data;
@@ -66,6 +74,7 @@ namespace ctranslate2 {
     const dim_t _batch_size;
     const dim_t _vocabulary_size;
     std::vector<int32_t> _flat_indices;
+    StorageView* _gpu_buffer = nullptr;  // non-owning pointer to pre-allocated GPU buffer
   };
 
   // Base class for processing the output logits.

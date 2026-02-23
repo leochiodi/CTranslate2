@@ -75,6 +75,11 @@ namespace ctranslate2 {
   public:
     virtual ~ContinuousLogitsProcessor() = default;
 
+    // One-time initialization after total_batch/vocab_size are known.
+    // Called before the decode loop begins. Default: no-op.
+    virtual void init(dim_t /*total_batch*/, dim_t /*beam_size*/,
+                      dim_t /*vocab_size*/, Device /*device*/) {}
+
     // Apply logits processing for the current batch.
     // slots: all slot states (max_slots elements).
     // active_slot_indices: indices of currently active slots.
@@ -92,6 +97,8 @@ namespace ctranslate2 {
   class ContinuousSuppressTokens : public ContinuousLogitsProcessor {
   public:
     explicit ContinuousSuppressTokens(std::vector<size_t> ids);
+    void init(dim_t total_batch, dim_t beam_size,
+              dim_t vocab_size, Device device) override;
     void apply(const std::vector<SlotState>& slots,
                const std::vector<size_t>& active_slot_indices,
                dim_t beam_size,
@@ -99,6 +106,8 @@ namespace ctranslate2 {
                DisableTokens& disable_tokens) override;
   private:
     const std::vector<size_t> _ids;
+    StorageView _gpu_indices;   // pre-computed [total_batch * _ids.size()] INT32 on GPU
+    bool _precomputed = false;
   };
 
   // Suppress blank tokens at generation step 0 only.
@@ -123,6 +132,8 @@ namespace ctranslate2 {
                              size_t timestamp_begin_id,
                              size_t timestamp_end_id,
                              size_t max_initial_timestamp_id);
+    void init(dim_t total_batch, dim_t beam_size,
+              dim_t vocab_size, Device device) override;
     void apply(const std::vector<SlotState>& slots,
                const std::vector<size_t>& active_slot_indices,
                dim_t beam_size,
@@ -134,6 +145,12 @@ namespace ctranslate2 {
     const size_t _timestamp_begin_id;
     const size_t _timestamp_end_id;
     const size_t _max_initial_timestamp_id;
+
+    // Pre-allocated buffers for apply() (avoids per-step GPU allocation).
+    StorageView _log_probs_buf;       // [total_batch, vocab_size] — reused across steps
+    StorageView _row_indices_buf;     // [total_batch] INT32 on GPU
+    StorageView _results_buf;         // [total_batch] INT32 on GPU
+    bool _initialized = false;
   };
 
   // Callback that returns the next request if available.

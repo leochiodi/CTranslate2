@@ -16,6 +16,20 @@ namespace ctranslate2 {
   {
   }
 
+  DisableTokens::DisableTokens(StorageView& logits,
+                                StorageView& gpu_buffer,
+                                const float disable_value)
+    : _logits(logits)
+    , _logits_data(logits.device() == Device::CPU ? logits.data<float>() : nullptr)
+    , _disable_value(disable_value)
+    , _batch_size(logits.dim(0))
+    , _vocabulary_size(logits.dim(1))
+    , _gpu_buffer(&gpu_buffer)
+  {
+    // Reserve capacity to reduce CPU push_back reallocs (timestamp rules path).
+    _flat_indices.reserve(_batch_size * 256);
+  }
+
   void DisableTokens::apply() {
     const dim_t num_indices = _flat_indices.size();
     if (num_indices == 0)
@@ -23,15 +37,39 @@ namespace ctranslate2 {
 
     const Device device = _logits.device();
     const DataType dtype = _logits.dtype();
-    const StorageView flat_indices({num_indices}, _flat_indices, device);
 
-    DEVICE_AND_TYPE_DISPATCH(device, dtype,
-                             primitives<D>::indexed_fill(_logits.data<T>(),
-                                                         static_cast<T>(_disable_value),
-                                                         flat_indices.data<int32_t>(),
-                                                         num_indices));
+    if (_gpu_buffer) {
+      // Use pre-allocated GPU buffer: resize (no-op if capacity sufficient), copy, run kernel.
+      _gpu_buffer->resize({num_indices});
+      _gpu_buffer->copy_from(_flat_indices.data(), num_indices, Device::CPU);
+
+      DEVICE_AND_TYPE_DISPATCH(device, dtype,
+                               primitives<D>::indexed_fill(_logits.data<T>(),
+                                                           static_cast<T>(_disable_value),
+                                                           _gpu_buffer->data<int32_t>(),
+                                                           num_indices));
+    } else {
+      // Original path: allocate temporary GPU StorageView.
+      const StorageView flat_indices({num_indices}, _flat_indices, device);
+
+      DEVICE_AND_TYPE_DISPATCH(device, dtype,
+                               primitives<D>::indexed_fill(_logits.data<T>(),
+                                                           static_cast<T>(_disable_value),
+                                                           flat_indices.data<int32_t>(),
+                                                           num_indices));
+    }
 
     _flat_indices.clear();
+  }
+
+  void DisableTokens::apply_precomputed(const StorageView& gpu_flat_indices) {
+    if (gpu_flat_indices.size() == 0)
+      return;
+    DEVICE_AND_TYPE_DISPATCH(_logits.device(), _logits.dtype(),
+                             primitives<D>::indexed_fill(_logits.data<T>(),
+                                                         static_cast<T>(_disable_value),
+                                                         gpu_flat_indices.data<int32_t>(),
+                                                         gpu_flat_indices.size()));
   }
 
 

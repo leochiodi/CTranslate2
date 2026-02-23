@@ -29,12 +29,34 @@ namespace ctranslate2 {
   {
   }
 
+  void ContinuousSuppressTokens::init(dim_t total_batch, dim_t beam_size,
+                                       dim_t vocab_size, Device device) {
+    // Pre-compute flat indices for ALL total_batch rows × all _ids.
+    // Since Step 2 runs all rows every step, we can apply unconditionally.
+    const dim_t num_indices = total_batch * static_cast<dim_t>(_ids.size());
+    std::vector<int32_t> flat_indices;
+    flat_indices.reserve(num_indices);
+    for (dim_t row = 0; row < total_batch; ++row) {
+      for (const size_t id : _ids)
+        flat_indices.push_back(static_cast<int32_t>(row * vocab_size + id));
+    }
+    // Upload to GPU once.
+    _gpu_indices = StorageView({num_indices}, flat_indices, device);
+    _precomputed = true;
+  }
+
   void ContinuousSuppressTokens::apply(
       const std::vector<SlotState>& slots,
       const std::vector<size_t>& active_slot_indices,
       dim_t beam_size,
       StorageView& /*logits*/,
       DisableTokens& disable_tokens) {
+    if (_precomputed) {
+      // Single async kernel — no CPU push_backs needed.
+      disable_tokens.apply_precomputed(_gpu_indices);
+      return;
+    }
+    // Fallback: original CPU loop.
     for (const size_t s : active_slot_indices) {
       for (dim_t b = 0; b < beam_size; ++b) {
         const dim_t row = static_cast<dim_t>(s) * beam_size + b;
@@ -80,6 +102,16 @@ namespace ctranslate2 {
   {
   }
 
+  void ContinuousTimestampRules::init(dim_t total_batch, dim_t /*beam_size*/,
+                                       dim_t vocab_size, Device device) {
+    // _log_probs_buf: NOT pre-allocated here because we don't know logits dtype yet.
+    // It will be lazily initialized on first apply() call (dtype from logits).
+    // After first call, resize_as is a no-op — capacity is reused across steps.
+    _row_indices_buf = StorageView({total_batch}, DataType::INT32, device);
+    _results_buf = StorageView({total_batch}, DataType::INT32, device);
+    _initialized = true;
+  }
+
   // Helper: check if timestamp log-prob exceeds max text token log-prob.
   template <Device D, typename T>
   static bool should_sample_timestamp(const StorageView& log_probs,
@@ -106,6 +138,8 @@ namespace ctranslate2 {
       DisableTokens& disable_tokens) {
 
     std::vector<dim_t> check_timestamps_prob_rows;
+    if (_initialized)
+      check_timestamps_prob_rows.reserve(logits.dim(0));
 
     for (const size_t s : active_slot_indices) {
       const auto& slot = slots[s];
@@ -176,41 +210,72 @@ namespace ctranslate2 {
     if (!check_timestamps_prob_rows.empty()) {
       disable_tokens.apply();
 
-      StorageView log_probs(logits.dtype(), logits.device());
-      ops::LogSoftMax()(logits, log_probs);
+      // Lazy init _log_probs_buf with correct dtype on first use; reused across steps.
+      if (!_log_probs_buf || _log_probs_buf.dtype() != logits.dtype())
+        _log_probs_buf = StorageView(logits.dtype(), logits.device());
+      ops::LogSoftMax()(logits, _log_probs_buf);
 
 #ifdef CT2_WITH_CUDA
-      if (log_probs.device() == Device::CUDA) {
+      if (_log_probs_buf.device() == Device::CUDA) {
         const dim_t num_rows = check_timestamps_prob_rows.size();
 
-        // Upload row indices to GPU (single H2D).
-        std::vector<int32_t> row_idx_cpu(num_rows);
-        for (dim_t i = 0; i < num_rows; ++i)
-          row_idx_cpu[i] = static_cast<int32_t>(check_timestamps_prob_rows[i]);
-        StorageView row_indices_gpu({num_rows}, row_idx_cpu, Device::CUDA);
+        if (_initialized) {
+          // Use pre-allocated row_indices and results buffers.
+          _row_indices_buf.resize({num_rows});
+          std::vector<int32_t> row_idx_cpu(num_rows);
+          for (dim_t i = 0; i < num_rows; ++i)
+            row_idx_cpu[i] = static_cast<int32_t>(check_timestamps_prob_rows[i]);
+          _row_indices_buf.copy_from(row_idx_cpu.data(), num_rows, Device::CPU);
 
-        // Allocate result buffer on GPU.
-        StorageView results_gpu({num_rows}, DataType::INT32, Device::CUDA);
+          _results_buf.resize({num_rows});
 
-        // Single kernel launch replaces N × 3 GPU syncs.
-        cuda::batch_timestamp_check_gpu(
-            log_probs.buffer(),
-            row_indices_gpu.data<int32_t>(),
-            static_cast<int>(num_rows),
-            static_cast<int>(log_probs.dim(-1)),
-            static_cast<int>(_timestamp_begin_id),
-            static_cast<int>(_timestamp_end_id - _timestamp_begin_id + 1),
-            results_gpu.data<int32_t>(),
-            log_probs.item_size());
+          cuda::batch_timestamp_check_gpu(
+              _log_probs_buf.buffer(),
+              _row_indices_buf.data<int32_t>(),
+              static_cast<int>(num_rows),
+              static_cast<int>(_log_probs_buf.dim(-1)),
+              static_cast<int>(_timestamp_begin_id),
+              static_cast<int>(_timestamp_end_id - _timestamp_begin_id + 1),
+              _results_buf.data<int32_t>(),
+              _log_probs_buf.item_size());
 
-        // Single D2H copy for all results.
-        StorageView results_cpu = results_gpu.to(Device::CPU);
+          // Single D2H copy for all results.
+          StorageView results_cpu = _results_buf.to(Device::CPU);
 
-        for (dim_t i = 0; i < num_rows; ++i) {
-          if (results_cpu.at<int32_t>(i)) {
-            const dim_t row = check_timestamps_prob_rows[i];
-            for (size_t t = 0; t < _timestamp_begin_id; ++t)
-              disable_tokens.add(row, t);
+          for (dim_t i = 0; i < num_rows; ++i) {
+            if (results_cpu.at<int32_t>(i)) {
+              const dim_t row = check_timestamps_prob_rows[i];
+              for (size_t t = 0; t < _timestamp_begin_id; ++t)
+                disable_tokens.add(row, t);
+            }
+          }
+        } else {
+          // Fallback: allocate temporaries (non-initialized path).
+          std::vector<int32_t> row_idx_cpu(num_rows);
+          for (dim_t i = 0; i < num_rows; ++i)
+            row_idx_cpu[i] = static_cast<int32_t>(check_timestamps_prob_rows[i]);
+          StorageView row_indices_gpu({num_rows}, row_idx_cpu, Device::CUDA);
+
+          StorageView results_gpu({num_rows}, DataType::INT32, Device::CUDA);
+
+          cuda::batch_timestamp_check_gpu(
+              _log_probs_buf.buffer(),
+              row_indices_gpu.data<int32_t>(),
+              static_cast<int>(num_rows),
+              static_cast<int>(_log_probs_buf.dim(-1)),
+              static_cast<int>(_timestamp_begin_id),
+              static_cast<int>(_timestamp_end_id - _timestamp_begin_id + 1),
+              results_gpu.data<int32_t>(),
+              _log_probs_buf.item_size());
+
+          StorageView results_cpu = results_gpu.to(Device::CPU);
+
+          for (dim_t i = 0; i < num_rows; ++i) {
+            if (results_cpu.at<int32_t>(i)) {
+              const dim_t row = check_timestamps_prob_rows[i];
+              for (size_t t = 0; t < _timestamp_begin_id; ++t)
+                disable_tokens.add(row, t);
+            }
           }
         }
       } else
@@ -220,9 +285,9 @@ namespace ctranslate2 {
         for (const dim_t row : check_timestamps_prob_rows) {
           bool sample_ts = false;
           DEVICE_AND_FLOAT_DISPATCH(
-            "ContinuousTimestampRules", log_probs.device(), log_probs.dtype(),
+            "ContinuousTimestampRules", _log_probs_buf.device(), _log_probs_buf.dtype(),
             (sample_ts = should_sample_timestamp<D, T>(
-              log_probs, row, _timestamp_begin_id, _timestamp_end_id)));
+              _log_probs_buf, row, _timestamp_begin_id, _timestamp_end_id)));
           if (sample_ts) {
             for (size_t i = 0; i < _timestamp_begin_id; ++i)
               disable_tokens.add(row, i);
@@ -816,6 +881,16 @@ namespace ctranslate2 {
     // Reusable scratch buffers (avoid per-step allocation).
     StorageView step_offsets({total_batch}, DataType::INT32);
     StorageView gather_indices_scratch({total_batch}, DataType::INT32);
+
+    // Step 10: Pre-allocated GPU buffer for DisableTokens (avoids per-step cudaMalloc).
+    // Worst case: total_batch × vocab_size indices (all tokens disabled for all rows).
+    // In practice, total_batch × timestamp_begin_id is the realistic max.
+    const dim_t max_disable_indices = total_batch * vocab_size;
+    StorageView disable_buf({max_disable_indices}, DataType::INT32, device);
+
+    // Step 10: Initialize logits processors (pre-compute GPU indices, pre-allocate buffers).
+    for (const auto& proc : _logits_processors)
+      proc->init(total_batch, _beam_size, vocab_size, device);
 
     // --- GPU-persistent beam state for pipelined beam search ---
     // These buffers live on GPU and are updated by beam_select_async each step.
@@ -1435,8 +1510,8 @@ namespace ctranslate2 {
       auto t5b = Clock::now();
       t_phase_b += elapsed_ms(t5a, t5b);
 
-      // Apply logits processors.
-      DisableTokens disable_tokens(logits);
+      // Apply logits processors (Step 10: use pre-allocated GPU buffer).
+      DisableTokens disable_tokens(logits, disable_buf);
       for (const auto& proc : _logits_processors)
         proc->apply(slots, active_slot_indices, _beam_size, logits, disable_tokens);
       disable_tokens.apply();

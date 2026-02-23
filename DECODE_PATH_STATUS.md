@@ -607,3 +607,122 @@ Server (`server.py`) with `DEVICE=cuda MAX_SLOTS=4 NUM_ENCODERS=1`:
 Note: earlier crashes were caused by missing `DEVICE=cuda` env var (default is `"cpu"`
 in `server.py:88`). CTranslate2 built without MKL has no CPU SGEMM backend, so loading
 the model on CPU aborts. Unrelated to Step 9.
+
+---
+
+## Step 10: Logits_proc hot path optimization
+
+**Target:** Eliminate per-step `cudaMalloc`/`cudaFree` and CPU `push_back` overhead in
+`DisableTokens::apply()` and `ContinuousSuppressTokens::apply()`.
+
+**Status:** DONE
+
+### Problem
+
+Profiling (Step 8) revealed `logits_proc` takes ~15.6ms/step (73% of per-step time) on
+DGX Spark 4-concurrent. The bottleneck is in `DisableTokens::apply()` which does
+**GPU allocate → H2D copy → Thrust indexed_fill → GPU free** every decode step. The CUB
+caching allocator can trigger `cudaMalloc` (implicit device sync) on cache miss, absorbing
+all async decoder GPU work into the logits_proc wall-clock measurement.
+
+The dominant processor is `ContinuousSuppressTokens` which does the **same work every step**
+(same token IDs × all batch rows) — 4000+ CPU `push_back` calls per step that are entirely
+pre-computable.
+
+### Changes
+
+- **`include/ctranslate2/decoding_utils.h`**:
+  - Added `apply_precomputed(const StorageView& gpu_flat_indices)` — applies pre-computed
+    GPU indices directly with a single `indexed_fill` kernel (no CPU→GPU transfer)
+  - Added constructor `DisableTokens(StorageView& logits, StorageView& gpu_buffer, ...)` —
+    accepts a pre-allocated GPU buffer, avoiding per-apply `cudaMalloc`
+  - Added `_gpu_buffer` non-owning pointer member
+
+- **`src/decoding_utils.cc`**:
+  - Implemented `apply_precomputed()` — single kernel launch, no allocation
+  - Modified `apply()` to use `_gpu_buffer` when available: `resize` (no-op if capacity
+    sufficient) + `copy_from` + `indexed_fill` — zero `cudaMalloc`
+  - GPU buffer constructor reserves `_flat_indices` capacity (`batch_size * 256`)
+
+- **`include/ctranslate2/continuous_decoding.h`**:
+  - Added virtual `init(total_batch, beam_size, vocab_size, device)` to
+    `ContinuousLogitsProcessor` base class (default no-op)
+  - `ContinuousSuppressTokens`: added `_gpu_indices` (pre-computed), `_precomputed` flag
+  - `ContinuousTimestampRules`: added `_log_probs_buf`, `_row_indices_buf`, `_results_buf`
+    persistent buffers, `_initialized` flag
+
+- **`src/continuous_decoding.cc`**:
+  - `ContinuousSuppressTokens::init()`: pre-computes flat indices for all total_batch rows ×
+    all suppress token IDs on CPU, uploads to GPU once. `apply()` calls `apply_precomputed()`
+    — single async kernel, zero CPU `push_back`s.
+  - `ContinuousTimestampRules::init()`: pre-allocates `_row_indices_buf` and `_results_buf`
+    on GPU. `_log_probs_buf` lazily initialized on first `apply()` with correct dtype
+    (avoids dtype mismatch with FLOAT16 logits). Subsequent steps reuse capacity.
+  - Engine `process()`: pre-allocates `disable_buf` (`total_batch × vocab_size` INT32),
+    calls `init()` on all processors before decode loop.
+
+### Per-step flow: before vs after
+
+**Before:**
+```
+SuppressTokens: 4000+ push_backs to CPU vector
+TimestampRules: push_backs, disable_tokens.apply() → cudaMalloc+H2D+kernel+cudaFree
+                LogSoftMax → cudaMalloc+kernel+cudaFree
+                batch_check → cudaMalloc+H2D+kernel+D2H+cudaFree
+Outer apply(): cudaMalloc+H2D+indexed_fill+cudaFree
+```
+
+**After:**
+```
+SuppressTokens: apply_precomputed() → single async indexed_fill kernel
+TimestampRules: push_backs (reserved vector), disable_tokens.apply() → copy to pre-alloc buf + kernel
+                LogSoftMax → into persistent _log_probs_buf (resize is no-op)
+                batch_check → pre-alloc row_indices + results bufs
+Outer apply(): copy to pre-alloc disable_buf + indexed_fill
+```
+
+### Debugging note
+
+Initial implementation caused a hang: `_log_probs_buf` was initialized as
+`StorageView(device)` (default FLOAT32) but `LogSoftMax` receives FLOAT16 logits.
+`resize_as()` only changes shape, not dtype — the kernel wrote FLOAT16 into a FLOAT32
+buffer, causing silent corruption/hang. Fixed by lazy-initializing `_log_probs_buf` with
+correct dtype on first use (`StorageView(logits.dtype(), logits.device())`).
+
+### After Step 10 (DGX Spark, max_slots=4, beam 5, f1_35s.wav)
+
+`test_correctness.sh` (standard generate path): 115 tokens exact match — PASS
+
+1-slot:
+- 110 steps, per_step=21.00ms, logits_proc=117.9ms — PASS
+
+4-concurrent (graph enabled):
+- 110 steps, per_step=20.91ms, logits_proc=1661.5ms
+- All 4 produce identical 109 tokens — CORRECT
+
+Staggered (graph enabled):
+- 149 steps, per_step=25.91ms, logits_proc=182.4ms
+- All 4 produce identical 109 tokens — CORRECT
+
+CT2_NO_CUDA_GRAPH=1:
+- 110 steps, per_step=20.97ms, logits_proc=1687.4ms
+- All 4 produce identical 109 tokens — CORRECT
+
+**Result:** On DGX Spark (unified memory), `logits_proc` timing is similar because
+`cudaMalloc`/`cudaFree` are near-free on unified memory (no PCIe overhead). The CUB caching
+allocator rarely misses, so the allocator sync cost that dominates on discrete GPUs is
+absent here. The optimization eliminates:
+- All CPU `push_back` loops in `ContinuousSuppressTokens` (pre-computed GPU indices)
+- All per-step `StorageView` constructor allocations in `DisableTokens::apply()` and
+  `ContinuousTimestampRules::apply()` (pre-allocated buffers with capacity reuse)
+
+Expected savings on H100 (PCIe, discrete memory):
+- Each `cudaMalloc` CUB cache miss: ~5-50us (device sync)
+- 4+ allocations eliminated per step × ~10us avg = ~40-200us/step saved
+- CPU `push_back` elimination: ~0.1-0.5ms/step saved (4000+ push_backs)
+
+### Step 10b (deferred): Prologue/epilogue multi-op fusion
+
+Original Step 10 target (fusing prologue/epilogue ops around decoder forward) saves <0.1ms
+since those ops are already inside CUDA Graph. Deferred in favor of the higher-impact
+logits_proc optimization above.
